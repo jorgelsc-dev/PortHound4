@@ -1,0 +1,5 @@
+porthound (1.0.0-1) unstable; urgency=medium
+
+  * Initial release of PortHound: a network scanning and service detection tool.
+
+ -- jorgelsc-dev <jorgelsc-dev@example.com>  Sun, 27 Apr 2025 12:00:00 +0000

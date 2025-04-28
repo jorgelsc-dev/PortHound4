@@ -1,0 +1,16 @@
+Source: porthound
+Section: utils
+Priority: optional
+Maintainer: jorgelsc-dev <jorgelsc-dev@example.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://github.com/jorgelsc-dev/porthound
+Rules-Requires-Root: no
+
+Package: porthound
+Architecture: all
+Depends: python3, ${misc:Depends}
+Description: PortHound - Network scanning and service detection tool
+ PortHound is a professional cybersecurity tool that facilitates network auditing
+ through port scanning and service identification. 
+ It is ideal for penetration testing and corporate network analysis.

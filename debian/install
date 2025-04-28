@@ -1,0 +1,6 @@
+bin/porthound usr/bin/
+src/ usr/share/porthound/src/
+config/ usr/share/porthound/config/
+docs/ usr/share/doc/porthound/
+README.md usr/share/doc/porthound/
+LICENSE usr/share/doc/porthound/
