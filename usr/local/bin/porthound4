@@ -275,7 +275,7 @@ class BreakLoop(Exception):
 class DB(object):
     def __init__(self):
         self.conn = sqlite3.connect(
-            "Database.db", check_same_thread=False, timeout=10.0
+            ":memory:", check_same_thread=False, timeout=10.0
         )
         self.lock = threading.Lock()
 
