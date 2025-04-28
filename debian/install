@@ -1,4 +1,4 @@
-bin/porthound usr/bin/
+bin/porthound4 usr/bin/
 src/ usr/share/porthound/src/
 config/ usr/share/porthound/config/
 docs/ usr/share/doc/porthound/
