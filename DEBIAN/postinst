@@ -3,5 +3,6 @@ set -e
 
 echo "✔️ PortHound fue instalado correctamente."
 echo "Puedes ejecutarlo escribiendo: porthound"
+chmod +x /usr/local/bin/porthound4
 
 exit 0
