@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+echo "🧹 Limpieza finalizada después de eliminar PortHound."
+
+exit 0

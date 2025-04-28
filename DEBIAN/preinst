@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+echo "🔍 Verificando requisitos para PortHound..."
+
+# Asegurar que python3 esté disponible
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "❌ Python3 no está instalado. Cancela la instalación."
+    exit 1
+fi
+
+exit 0

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "✔️ PortHound was successfully installed."
-echo "You can run PortHound by typing: porthound"
+echo "✔️ PortHound fue instalado correctamente."
+echo "Puedes ejecutarlo escribiendo: porthound"
 
 exit 0
