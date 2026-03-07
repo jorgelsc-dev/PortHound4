@@ -1,0 +1,4298 @@
+import re
+import socket
+import threading
+import json
+import sqlite3
+import hashlib
+import errno
+from os import getenv
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, UTC
+import time
+import ipaddress
+from urllib.parse import urlsplit
+
+from geoip_seed import (
+    GEOIP_SEED_PATH as DEFAULT_GEOIP_SEED_PATH,
+    lookup_geoip_ipv4_in_db,
+    read_geoip_status_from_db,
+    resolve_geoip_seed_path,
+    sync_geoip_seed_into_db,
+)
+from scan_payloads import (
+    BANNER_TCP_PROBES,
+    BANNER_UDP_PROBES,
+    TCP_HTTP_PORTS,
+    TCP_HTTP_PROBES,
+    TCP_PORT_PROBE_OVERRIDES,
+    UDP_PORT_PROBE_OVERRIDES,
+)
+from banner_rules import build_banner_rule_tags, review_banner_payload
+
+
+class BreakLoop(Exception):
+    pass
+
+
+def _resolve_scan_source_ip():
+    raw_value = str(getenv("PORTHOUND_IP", "")).strip()
+    if not raw_value:
+        return ""
+    try:
+        ipaddress.IPv4Address(raw_value)
+        return raw_value
+    except Exception:
+        print(f"[scan] ignoring invalid PORTHOUND_IP={raw_value!r}")
+        return ""
+
+
+SCAN_SOURCE_IP = _resolve_scan_source_ip()
+_SOURCE_BIND_WARNING_EMITTED = False
+
+
+def bind_source_ip(sock, strict=False):
+    global _SOURCE_BIND_WARNING_EMITTED
+    source_ip = SCAN_SOURCE_IP
+    if not source_ip or not sock:
+        return
+    try:
+        sock.bind((source_ip, 0))
+    except Exception as exc:
+        if strict:
+            raise
+        if not _SOURCE_BIND_WARNING_EMITTED:
+            print(f"[scan] source bind warning ({source_ip}): {exc}")
+            _SOURCE_BIND_WARNING_EMITTED = True
+
+
+def dedupe_probe_payloads(payloads):
+    unique = []
+    seen = set()
+    for payload in payloads:
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8", errors="ignore")
+        if not isinstance(payload, (bytes, bytearray)):
+            continue
+        payload = bytes(payload)
+        if payload in seen:
+            continue
+        seen.add(payload)
+        unique.append(payload)
+    return unique
+
+
+def icmp_checksum(packet):
+    if len(packet) % 2:
+        packet += b"\x00"
+    checksum = 0
+    for i in range(0, len(packet), 2):
+        checksum += (packet[i] << 8) + packet[i + 1]
+    checksum = (checksum >> 16) + (checksum & 0xFFFF)
+    checksum += checksum >> 16
+    return (~checksum) & 0xFFFF
+
+
+def supports_sctp():
+    proto = getattr(socket, "IPPROTO_SCTP", None)
+    if proto is None:
+        return False
+
+    socket_types = [socket.SOCK_STREAM]
+    sock_seqpacket = getattr(socket, "SOCK_SEQPACKET", None)
+    if sock_seqpacket is not None:
+        socket_types.append(sock_seqpacket)
+
+    for socket_type in socket_types:
+        probe = None
+        try:
+            probe = socket.socket(socket.AF_INET, socket_type, proto)
+            return True
+        except Exception:
+            continue
+        finally:
+            try:
+                if probe:
+                    probe.close()
+            except Exception:
+                pass
+    return False
+
+
+def detect_target_protocols():
+    # Always expose SCTP target type. When native SCTP sockets are unavailable,
+    # the SCTP worker falls back to host-discovery mode.
+    return {"tcp", "udp", "icmp", "sctp"}
+
+
+def tcp_reachability_probe(host, timeout=1.0, ports=None):
+    result = {
+        "state": "FILTERED",
+        "tiempo_ms": None,
+        "method": "tcp_connect_fallback",
+        "probe_port": None,
+    }
+    candidate_ports = tuple(ports or (22, 80, 443, 445, 3389, 53))
+    timeout = max(0.2, float(timeout))
+    start = time.time()
+
+    reachable_codes = {0}
+    for code_name in ("ECONNREFUSED", "ECONNRESET"):
+        code_value = getattr(errno, code_name, None)
+        if isinstance(code_value, int):
+            reachable_codes.add(code_value)
+    # Common Windows socket error codes for "refused/reset".
+    reachable_codes.update({10061, 10054})
+
+    for port in candidate_ports:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            bind_source_ip(sock)
+            sock.settimeout(timeout)
+            code = sock.connect_ex((host, int(port)))
+            result["probe_port"] = int(port)
+            if code in reachable_codes:
+                end = time.time()
+                result["state"] = "OPEN"
+                result["tiempo_ms"] = round((end - start) * 1000, 2)
+                return result
+        except socket.timeout:
+            result["probe_port"] = int(port)
+        except Exception:
+            result["probe_port"] = int(port)
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+
+    end = time.time()
+    result["tiempo_ms"] = round((end - start) * 1000, 2)
+    return result
+
+
+TARGET_TYPES = {"common", "not_common", "full"}
+TARGET_PROTOS = detect_target_protocols()
+TARGET_STATUSES = {"active", "stopped", "restarting"}
+TARGET_PORT_MODES = {"preset", "single", "range"}
+PORT_SCAN_STATUSES = {"active", "stopped", "restarting"}
+PORT_MIN = 1
+PORT_MAX = 65535
+
+
+def parse_port_number(value, field_name: str) -> int:
+    try:
+        port = int(value)
+    except Exception:
+        raise ValueError(f"Invalid {field_name}")
+    if port < PORT_MIN or port > PORT_MAX:
+        raise ValueError(f"{field_name} must be between {PORT_MIN} and {PORT_MAX}")
+    return port
+
+
+def normalize_target_port_config(item: dict, proto: str) -> dict:
+    mode_raw = item.get("port_mode", item.get("scan_mode", "preset"))
+    mode = str(mode_raw or "preset").strip().lower()
+    if proto == "icmp":
+        # ICMP host discovery does not use transport-layer ports.
+        return {"port_mode": "preset", "port_start": 0, "port_end": 0}
+    if mode not in TARGET_PORT_MODES:
+        allowed = ", ".join(sorted(TARGET_PORT_MODES))
+        raise ValueError(f"Invalid port_mode. Use {allowed}")
+
+    output = {"port_mode": mode, "port_start": 0, "port_end": 0}
+    if mode == "single":
+        single_value = item.get("port")
+        if single_value is None:
+            single_value = item.get("port_start", item.get("port_end"))
+        if single_value is None:
+            raise ValueError("port is required when port_mode is single")
+        single_port = parse_port_number(single_value, "port")
+        output["port_start"] = single_port
+        output["port_end"] = single_port
+        return output
+
+    if mode == "range":
+        start_value = item.get("port_start", item.get("start_port"))
+        end_value = item.get("port_end", item.get("end_port"))
+        if start_value is None or end_value is None:
+            raise ValueError("port_start and port_end are required when port_mode is range")
+        start_port = parse_port_number(start_value, "port_start")
+        end_port = parse_port_number(end_value, "port_end")
+        if start_port > end_port:
+            raise ValueError("port_start must be <= port_end")
+        output["port_start"] = start_port
+        output["port_end"] = end_port
+        return output
+
+    return output
+
+
+def resolve_target_ports(type_scan: str, port_mode="preset", port_start=None, port_end=None):
+    mode = str(port_mode or "preset").strip().lower()
+    if mode == "single":
+        try:
+            single_port = int(port_start if port_start is not None else port_end)
+        except Exception:
+            return range(0)
+        if single_port < PORT_MIN or single_port > PORT_MAX:
+            return range(0)
+        return range(single_port, single_port + 1)
+
+    if mode == "range":
+        try:
+            start_port = int(port_start)
+            end_port = int(port_end)
+        except Exception:
+            return range(0)
+        if (
+            start_port < PORT_MIN
+            or start_port > PORT_MAX
+            or end_port < PORT_MIN
+            or end_port > PORT_MAX
+            or start_port > end_port
+        ):
+            return range(0)
+        return range(start_port, end_port + 1)
+
+    if type_scan == "common":
+        return range(1, 1024)
+    if type_scan == "not_common":
+        return range(1024, 65535)
+    if type_scan == "full":
+        return range(1, 65535)
+    return range(0)
+
+class DB(object):
+    def __init__(self, path="Database.db", geoip_seed_path=None):
+        self.path = str(path)
+        self.geoip_seed_path = str(
+            resolve_geoip_seed_path(geoip_seed_path or DEFAULT_GEOIP_SEED_PATH)
+        )
+        self.conn = sqlite3.connect(
+            self.path, check_same_thread=False, timeout=10.0
+        )
+        self.lock = threading.Lock()
+        self.geoip_status_cache = None
+
+    def config(self):
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA locking_mode=EXCLUSIVE;")
+        self.conn.execute("PRAGMA optimize;")
+        self.conn.execute("PRAGMA mmap_size=1073741824;")
+        self.conn.commit()
+
+    def create_tables(self):
+        self.lock.acquire()
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS targets ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "network TEXT NOT NULL,"
+                "type TEXT NOT NULL,"
+                "proto TEXT NOT NULL,"
+                "port_mode TEXT NOT NULL DEFAULT 'preset',"
+                "port_start INTEGER NOT NULL DEFAULT 0,"
+                "port_end INTEGER NOT NULL DEFAULT 0,"
+                "timesleep REAL DEFAULT 1.0,"
+                "progress REAL DEFAULT 0.0,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(network, type, proto, timesleep, port_mode, port_start, port_end)"
+                ");"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS banners ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "ip TEXT NOT NULL,"
+                "port INTEGER NOT NULL,"
+                "proto TEXT NOT NULL,"
+                "response BLOB NOT NULL,"
+                "response_plain TEXT NOT NULL,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(ip,port,proto,response)"
+                ");"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS favicons ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "ip TEXT NOT NULL,"
+                "port INTEGER NOT NULL,"
+                "proto TEXT NOT NULL,"
+                "icon_url TEXT NOT NULL,"
+                "mime_type TEXT NOT NULL,"
+                "icon_blob BLOB NOT NULL,"
+                "size INTEGER NOT NULL,"
+                "sha256 TEXT NOT NULL,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(ip, port, proto, sha256)"
+                ");"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS tags ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "ip TEXT NOT NULL,"
+                "port INTEGER NOT NULL,"
+                "proto TEXT NOT NULL,"
+                "key TEXT NOT NULL,"
+                "value TEXT NOT NULL,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(ip, port, proto, key)"
+                ");"
+            )
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS ports ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "ip TEXT NOT NULL,"
+                "port INTEGER NOT NULL,"
+                "proto TEXT NOT NULL,"
+                "state TEXT NOT NULL,"  # OPEN FILTERED
+                "scan_state TEXT NOT NULL DEFAULT 'active',"
+                "progress REAL DEFAULT 0.0,"
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(ip, port, proto)"
+                ");"
+            )
+            cursor.execute("PRAGMA table_info(targets);")
+            target_columns = {row[1] for row in cursor.fetchall()}
+            if "port_mode" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN port_mode TEXT NOT NULL DEFAULT 'preset';"
+                )
+            if "port_start" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN port_start INTEGER DEFAULT 0;"
+                )
+            if "port_end" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN port_end INTEGER DEFAULT 0;"
+                )
+            if "status" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'active';"
+                )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_mode = 'preset' "
+                "WHERE port_mode IS NULL OR trim(port_mode) = '' "
+                "OR lower(port_mode) NOT IN ('preset', 'single', 'range');"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_start = 0, port_end = 0 "
+                "WHERE lower(port_mode) = 'preset';"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_end = port_start "
+                "WHERE lower(port_mode) = 'single' "
+                "AND port_start IS NOT NULL "
+                "AND (port_end IS NULL OR port_end <> port_start);"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_mode = 'preset', port_start = 0, port_end = 0 "
+                "WHERE port_start IS NOT NULL "
+                "AND (port_start < 1 OR port_start > 65535);"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_mode = 'preset', port_start = 0, port_end = 0 "
+                "WHERE port_end IS NOT NULL "
+                "AND (port_end < 1 OR port_end > 65535);"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET port_mode = 'preset', port_start = 0, port_end = 0 "
+                "WHERE lower(port_mode) = 'range' "
+                "AND port_start IS NOT NULL AND port_end IS NOT NULL "
+                "AND port_start > port_end;"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET status = 'active' "
+                "WHERE status IS NULL OR trim(status) = '' "
+                "OR lower(status) NOT IN ('active', 'stopped', 'restarting');"
+            )
+            cursor.execute("PRAGMA table_info(ports);")
+            port_columns = {row[1] for row in cursor.fetchall()}
+            if "scan_state" not in port_columns:
+                cursor.execute(
+                    "ALTER TABLE ports "
+                    "ADD COLUMN scan_state TEXT NOT NULL DEFAULT 'active';"
+                )
+            cursor.execute(
+                "UPDATE ports "
+                "SET scan_state = 'active' "
+                "WHERE scan_state IS NULL OR trim(scan_state) = '' "
+                "OR lower(scan_state) NOT IN ('active', 'stopped', 'restarting');"
+            )
+            self.conn.commit()
+            cursor.close()
+            cursor = None
+            self.geoip_status_cache = sync_geoip_seed_into_db(
+                self.conn, self.geoip_seed_path
+            )
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> create_tables():", e)
+        finally:
+            if cursor is not None:
+                cursor.close()
+            self.lock.release()
+
+    def geoip_status(self):
+        output = {}
+        self.lock.acquire()
+        try:
+            output = read_geoip_status_from_db(self.conn, self.geoip_seed_path)
+            self.geoip_status_cache = dict(output)
+        except Exception as e:
+            print("DB() -> geoip_status():", e)
+            output = dict(self.geoip_status_cache or {})
+        finally:
+            self.lock.release()
+            return output
+
+    def lookup_geoip_ipv4(self, ip_value):
+        output = None
+        self.lock.acquire()
+        try:
+            output = lookup_geoip_ipv4_in_db(self.conn, ip_value)
+        except Exception as e:
+            print("DB() -> lookup_geoip_ipv4():", e)
+            output = None
+        finally:
+            self.lock.release()
+            return output
+
+    def insert_targets(self, data: dict) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO targets ("
+                "network, type, proto, port_mode, port_start, port_end, timesleep, status"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                (
+                    data["network"],
+                    data["type"],
+                    data["proto"],
+                    data.get("port_mode", "preset"),
+                    data.get("port_start"),
+                    data.get("port_end"),
+                    data["timesleep"],
+                    data.get("status", "active"),
+                ),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_targets():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def update_targets(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id FROM targets WHERE id = ?;",
+                (data["id"],),
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE targets "
+                    "SET network = ?, "
+                    " type = ?,"
+                    " proto = ?,"
+                    " port_mode = ?,"
+                    " port_start = ?,"
+                    " port_end = ?,"
+                    " progress = ?,"
+                    " timesleep = ?,"
+                    " status = ? "
+                    "WHERE id = ?;",
+                    (
+                        data["network"],
+                        data["type"],
+                        data["proto"],
+                        data.get("port_mode", "preset"),
+                        data.get("port_start"),
+                        data.get("port_end"),
+                        0.0,
+                        data["timesleep"],
+                        data.get("status", "active"),
+                        data["id"],
+                    ),
+                )
+                self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> update_targets():", e)
+        finally:
+            self.lock.release()
+
+    def select_target_by_id(self, identifier: int):
+        output = None
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets WHERE id = ? LIMIT 1;",
+                (int(identifier),),
+            )
+            row = cursor.fetchone()
+            if row:
+                column_names = [col[0] for col in cursor.description]
+                output = dict(zip(column_names, row))
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_target_by_id():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def set_target_status(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            status = str(data.get("status", "")).strip().lower()
+            if status not in TARGET_STATUSES:
+                raise ValueError("Invalid target status")
+            cursor.execute(
+                "UPDATE targets "
+                "SET status = ?, "
+                " updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (status, int(data["id"])),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> set_target_status():", e)
+        finally:
+            self.lock.release()
+
+    def set_target_progress(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE targets "
+                "SET progress = ?, "
+                " updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (float(data["progress"]), int(data["id"])),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> set_target_progress():", e)
+        finally:
+            self.lock.release()
+
+    def clear_target_artifacts(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT network, proto FROM targets WHERE id = ? LIMIT 1;",
+                (int(data["id"]),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                cursor.close()
+                return
+            network = ipaddress.ip_network(str(row[0]), strict=False)
+            proto = str(row[1])
+
+            def _collect_ids(table_name: str):
+                cursor.execute(
+                    f"SELECT id, ip FROM {table_name} WHERE proto = ?;",
+                    (proto,),
+                )
+                matched = []
+                for result_id, ip_value in cursor.fetchall():
+                    try:
+                        ip_addr = ipaddress.ip_address(str(ip_value))
+                    except Exception:
+                        continue
+                    if ip_addr in network:
+                        matched.append((result_id,))
+                return matched
+
+            ports_ids = _collect_ids("ports")
+            tags_ids = _collect_ids("tags")
+            banners_ids = _collect_ids("banners")
+            favicons_ids = _collect_ids("favicons")
+
+            if ports_ids:
+                cursor.executemany("DELETE FROM ports WHERE id = ?;", ports_ids)
+            if tags_ids:
+                cursor.executemany("DELETE FROM tags WHERE id = ?;", tags_ids)
+            if banners_ids:
+                cursor.executemany("DELETE FROM banners WHERE id = ?;", banners_ids)
+            if favicons_ids:
+                cursor.executemany("DELETE FROM favicons WHERE id = ?;", favicons_ids)
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> clear_target_artifacts():", e)
+        finally:
+            self.lock.release()
+
+    def delete_target(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM targets WHERE id = ?;",
+                (data["id"],),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_target():", e)
+        finally:
+            self.lock.release()
+
+    def delete_banners(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM banners;")
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_banners():", e)
+        finally:
+            self.lock.release()
+
+    def delete_favicons(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM favicons;")
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_favicons():", e)
+        finally:
+            self.lock.release()
+
+    def delete_ports_where_tcp(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM ports WHERE proto = ?;", ("tcp",))
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_ports_where_tcp():", e)
+        finally:
+            self.lock.release()
+
+    def delete_ports_where_udp(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM ports WHERE proto = ?;", ("udp",))
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_ports_where_udp():", e)
+        finally:
+            self.lock.release()
+
+    def delete_ports_where_icmp(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM ports WHERE proto = ?;", ("icmp",))
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_ports_where_icmp():", e)
+        finally:
+            self.lock.release()
+
+    def delete_ports_where_sctp(self) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("DELETE FROM ports WHERE proto = ?;", ("sctp",))
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_ports_where_sctp():", e)
+        finally:
+            self.lock.release()
+
+    def select_targets(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM targets;")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_targets():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_targets_where_tcp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets "
+                "WHERE proto = ? "
+                "AND status IN ('active', 'restarting');",
+                ("tcp",),
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_targets_where_tcp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_targets_where_udp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets "
+                "WHERE proto = ? "
+                "AND status IN ('active', 'restarting');",
+                ("udp",),
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_targets_where_udp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_targets_where_icmp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets "
+                "WHERE proto = ? "
+                "AND status IN ('active', 'restarting');",
+                ("icmp",),
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_targets_where_icmp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_targets_where_sctp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets "
+                "WHERE proto IN (?, ?) "
+                "AND status IN ('active', 'restarting');",
+                ("sctp", "stcp"),
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_targets_where_sctp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def exists_targets(self, data: dict) -> bool:
+        exists = False
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM targets "
+                "WHERE network = ? AND "
+                "type = ? AND "
+                "proto = ? AND "
+                "COALESCE(port_mode, 'preset') = ? AND "
+                "COALESCE(port_start, -1) = COALESCE(?, -1) AND "
+                "COALESCE(port_end, -1) = COALESCE(?, -1) AND "
+                "timesleep = ?;",
+                (
+                    data["network"],
+                    data["type"],
+                    data["proto"],
+                    data.get("port_mode", "preset"),
+                    data.get("port_start"),
+                    data.get("port_end"),
+                    data["timesleep"],
+                ),
+            )
+            row = cursor.fetchone()
+            if row:
+                exists = True
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> exists_targets():", e)
+        finally:
+            self.lock.release()
+            return exists
+
+    def select_ports(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports;")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_port_by_id(self, identifier: int):
+        output = None
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports WHERE id = ? LIMIT 1;", (int(identifier),))
+            row = cursor.fetchone()
+            if row:
+                column_names = [col[0] for col in cursor.description]
+                output = dict(zip(column_names, row))
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_port_by_id():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def set_port_scan_state(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            status = str(data.get("scan_state", "")).strip().lower()
+            if status not in PORT_SCAN_STATUSES:
+                raise ValueError("Invalid port scan state")
+            cursor.execute(
+                "UPDATE ports "
+                "SET scan_state = ?, "
+                " updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (status, int(data["id"])),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> set_port_scan_state():", e)
+        finally:
+            self.lock.release()
+
+    def clear_port_artifacts(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT ip, port, proto FROM ports WHERE id = ? LIMIT 1;",
+                (int(data["id"]),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                cursor.close()
+                return
+            ip_value, port_value, proto_value = str(row[0]), int(row[1]), str(row[2])
+            cursor.execute(
+                "DELETE FROM banners WHERE ip = ? AND port = ? AND proto = ?;",
+                (ip_value, port_value, proto_value),
+            )
+            cursor.execute(
+                "DELETE FROM favicons WHERE ip = ? AND port = ? AND proto = ?;",
+                (ip_value, port_value, proto_value),
+            )
+            cursor.execute(
+                "DELETE FROM tags WHERE ip = ? AND port = ? AND proto = ?;",
+                (ip_value, port_value, proto_value),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> clear_port_artifacts():", e)
+        finally:
+            self.lock.release()
+
+    def select_ports_where_tcp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports WHERE proto='tcp';")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_tcp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_ports_where_udp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports WHERE proto='udp';")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_udp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_ports_where_icmp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports WHERE proto='icmp';")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_icmp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_ports_where_sctp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM ports WHERE proto='sctp';")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_sctp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_tags(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM tags;")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_tags():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_tags_tcp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM tags WHERE " "proto = ?;", ("tcp",))
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_tags_tcp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_tags_udp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM tags WHERE " "proto = ?;", ("udp",))
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_tags_udp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_tags_icmp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM tags WHERE " "proto = ?;", ("icmp",))
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_tags_icmp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_tags_sctp(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM tags WHERE " "proto = ?;", ("sctp",))
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_tags_sctp():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_banners(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT "
+                "b.id, b.ip, b.port, b.proto, b.response_plain, b.created_at, b.updated_at, "
+                "p.id AS port_id, p.progress AS scan_progress, p.scan_state AS scan_state "
+                "FROM banners b "
+                "LEFT JOIN ports p "
+                "ON p.ip = b.ip AND p.port = b.port AND p.proto = b.proto;"
+            )
+            output = [
+                {
+                    "id": row[0],
+                    "ip": row[1],
+                    "port": row[2],
+                    "proto": row[3],
+                    "response_plain": row[4],
+                    "created_at": row[5],
+                    "updated_at": row[6],
+                    "port_id": row[7],
+                    "scan_progress": row[8],
+                    "scan_state": row[9],
+                }
+                for row in cursor.fetchall()
+            ]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_banners():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def banner_exists(self, ip: str, port: int, proto: str) -> bool:
+        exists = False
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT 1 FROM banners WHERE ip = ? AND port = ? AND proto = ? LIMIT 1;",
+                (str(ip), int(port), str(proto)),
+            )
+            exists = cursor.fetchone() is not None
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> banner_exists():", e)
+        finally:
+            self.lock.release()
+            return exists
+
+    def select_favicons(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, ip, port, proto, icon_url, mime_type, size, sha256, created_at, updated_at "
+                "FROM favicons "
+                "ORDER BY id DESC;"
+            )
+            output = [
+                {
+                    "id": row[0],
+                    "ip": row[1],
+                    "port": row[2],
+                    "proto": row[3],
+                    "icon_url": row[4],
+                    "mime_type": row[5],
+                    "size": row[6],
+                    "sha256": row[7],
+                    "created_at": row[8],
+                    "updated_at": row[9],
+                }
+                for row in cursor.fetchall()
+            ]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_favicons():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def get_favicon_by_id(self, icon_id: int):
+        output = None
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, ip, port, proto, icon_url, mime_type, icon_blob, size, sha256, created_at, updated_at "
+                "FROM favicons "
+                "WHERE id = ?;",
+                (int(icon_id),),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": row[0],
+                    "ip": row[1],
+                    "port": row[2],
+                    "proto": row[3],
+                    "icon_url": row[4],
+                    "mime_type": row[5],
+                    "icon_blob": row[6],
+                    "size": row[7],
+                    "sha256": row[8],
+                    "created_at": row[9],
+                    "updated_at": row[10],
+                }
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> get_favicon_by_id():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def insert_banners(self, data: dict) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO banners (ip, port, proto, response, response_plain) VALUES (?, ?, ?, ?, ?);",
+                (
+                    data["ip"],
+                    data["port"],
+                    data["proto"],
+                    data["response"],
+                    data["response_plain"],
+                ),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_banners():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def insert_favicon(self, data: dict) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO favicons "
+                "(ip, port, proto, icon_url, mime_type, icon_blob, size, sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                (
+                    data["ip"],
+                    data["port"],
+                    data["proto"],
+                    data["icon_url"],
+                    data["mime_type"],
+                    data["icon_blob"],
+                    data["size"],
+                    data["sha256"],
+                ),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_favicon():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def favicon_exists(self, ip: str, port: int, proto: str) -> bool:
+        exists = False
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT 1 FROM favicons WHERE ip = ? AND port = ? AND proto = ? LIMIT 1;",
+                (ip, int(port), proto),
+            )
+            exists = cursor.fetchone() is not None
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> favicon_exists():", e)
+        finally:
+            self.lock.release()
+            return exists
+
+    def insert_port(self, data: dict) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO ports (ip, port, proto, state) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(ip, port, proto) DO UPDATE SET "
+                "state = excluded.state, "
+                "progress = CASE "
+                "WHEN COALESCE(scan_state, 'active') = 'stopped' THEN progress "
+                "ELSE 0.0 END, "
+                "scan_state = CASE "
+                "WHEN COALESCE(scan_state, 'active') = 'stopped' THEN 'stopped' "
+                "ELSE 'active' END, "
+                "updated_at = CURRENT_TIMESTAMP;",
+                (
+                    data["ip"],
+                    data["port"],
+                    data["proto"],
+                    data["state"],
+                ),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_port():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def insert_tags(self, data: dict) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO tags (ip, port, proto, key, value) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(ip, port, proto, key) DO UPDATE SET "
+                "value = excluded.value, "
+                "updated_at = CURRENT_TIMESTAMP;",
+                (
+                    data["ip"],
+                    data["port"],
+                    data["proto"],
+                    data["key"],
+                    data["value"],
+                ),
+            )
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_tags():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def targets_progress(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id FROM targets WHERE id = ?;",
+                (data["id"],),
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE targets "
+                    "SET progress = ? "
+                    "WHERE id = ? "
+                    "AND proto = ?;",
+                    (data["progress"], data["id"], data["proto"]),
+                )
+                self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> targets_progress():", e)
+        finally:
+            self.lock.release()
+
+    def ports_progress(self, data: dict) -> None:
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id FROM ports WHERE id = ?;",
+                (data["id"],),
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE ports " "SET progress = ? " "WHERE id = ?;",
+                    (data["progress"], data["id"]),
+                )
+                self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> ports_progress():", e)
+        finally:
+            self.lock.release()
+
+    def is_port_scan_runnable(self, identifier: int) -> bool:
+        runnable = False
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT scan_state FROM ports WHERE id = ? LIMIT 1;",
+                (int(identifier),),
+            )
+            row = cursor.fetchone()
+            runnable = bool(
+                row and str(row[0] or "").strip().lower() in {"active", "restarting"}
+            )
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> is_port_scan_runnable():", e)
+        finally:
+            self.lock.release()
+            return runnable
+
+    def select_ports_where_udp_for_scan(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM ports "
+                "WHERE proto = 'udp' "
+                "AND scan_state IN ('active', 'restarting');"
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_udp_for_scan():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def select_ports_where_tcp_for_scan(self) -> list:
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT * FROM ports "
+                "WHERE proto = 'tcp' "
+                "AND scan_state IN ('active', 'restarting');"
+            )
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> select_ports_where_tcp_for_scan():", e)
+        finally:
+            self.lock.release()
+            return output
+
+    def count_ports(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM ports;")
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_ports():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_ports_where_udp(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM ports WHERE proto = ?;", ("udp",))
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_ports_where_udp():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_ports_where_tcp(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM ports WHERE proto = ?;", ("tcp",))
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_ports_where_tcp():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_ports_where_icmp(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM ports WHERE proto = ?;", ("icmp",))
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_ports_where_icmp():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_ports_where_sctp(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM ports WHERE proto = ?;", ("sctp",))
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_ports_where_sctp():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_banners(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM banners;")
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_banners():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_favicons(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM favicons;")
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_favicons():", e)
+        finally:
+            self.lock.release()
+            return count
+
+    def count_targets(self) -> None:
+        count = 0
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(id) FROM targets;")
+            count = cursor.fetchone()[0]
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> count_targets():", e)
+        finally:
+            self.lock.release()
+            return count
+
+
+class API(threading.Thread):
+    STATUS_MESSAGES = {
+        # Respuestas informativas (1xx)
+        100: "Continue",
+        101: "Switching Protocols",
+        102: "Processing",
+        103: "Early Hints",
+        # Respuestas satisfactorias (2xx)
+        200: "OK",
+        201: "Created",
+        202: "Accepted",
+        203: "Non-Authoritative Information",
+        204: "No Content",
+        205: "Reset Content",
+        206: "Partial Content",
+        207: "Multi-Status",
+        208: "Already Reported",
+        226: "IM Used",
+        # Redirecciones (3xx)
+        300: "Multiple Choices",
+        301: "Moved Permanently",
+        302: "Found",
+        303: "See Other",
+        304: "Not Modified",
+        305: "Use Proxy",
+        307: "Temporary Redirect",
+        308: "Permanent Redirect",
+        # Errores del cliente (4xx)
+        400: "Bad Request",
+        401: "Unauthorized",
+        402: "Payment Required",
+        403: "Forbidden",
+        404: "Not Found",
+        405: "Method Not Allowed",
+        406: "Not Acceptable",
+        407: "Proxy Authentication Required",
+        408: "Request Timeout",
+        409: "Conflict",
+        410: "Gone",
+        411: "Length Required",
+        412: "Precondition Failed",
+        413: "Payload Too Large",
+        414: "URI Too Long",
+        415: "Unsupported Media Type",
+        416: "Range Not Satisfiable",
+        417: "Expectation Failed",
+        418: "I'm a teapot",
+        421: "Misdirected Request",
+        422: "Unprocessable Entity",
+        423: "Locked",
+        424: "Failed Dependency",
+        425: "Too Early",
+        426: "Upgrade Required",
+        428: "Precondition Required",
+        429: "Too Many Requests",
+        431: "Request Header Fields Too Large",
+        451: "Unavailable For Legal Reasons",
+        # Errores del servidor (5xx)
+        500: "Internal Server Error",
+        501: "Not Implemented",
+        502: "Bad Gateway",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+        505: "HTTP Version Not Supported",
+        506: "Variant Also Negotiates",
+        507: "Insufficient Storage",
+        508: "Loop Detected",
+        510: "Not Extended",
+        511: "Network Authentication Required",
+    }
+    REGEX_IPV4_CIDR = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
+    VALID_TARGET_TYPES = TARGET_TYPES
+    VALID_TARGET_PROTOS = TARGET_PROTOS
+    VALID_TARGET_STATUSES = TARGET_STATUSES
+    VALID_TARGET_PORT_MODES = TARGET_PORT_MODES
+    MAX_CONNECTION_WORKERS = 32
+    MAX_REQUEST_HEADER_BYTES = 64 * 1024
+    MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+    REQUEST_RECV_CHUNK_SIZE = 4096
+    REQUEST_SOCKET_TIMEOUT = 10.0
+
+    def __init__(self, db: DB, host="127.0.0.1", port=45678):
+        threading.Thread.__init__(self)
+        self.host = host
+        self.port = port
+        self.db = db
+        self.stop_event = threading.Event()
+
+    def run(self):
+        self.db.create_tables()
+        threading.Thread(target=self.task, daemon=True).start()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.listen()
+            print(f"Server running on {self.host}:{self.port}")
+            with ThreadPoolExecutor(
+                max_workers=self.MAX_CONNECTION_WORKERS,
+                thread_name_prefix="legacy-api",
+            ) as pool:
+                while True:
+                    conn, addr = s.accept()
+                    pool.submit(self.handle_client, conn, addr)
+
+    def _recv_http_request(self, conn):
+        conn.settimeout(self.REQUEST_SOCKET_TIMEOUT)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(self.REQUEST_RECV_CHUNK_SIZE)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > self.MAX_REQUEST_HEADER_BYTES:
+                raise ValueError("Request headers too large")
+
+        if not data:
+            return ""
+
+        header_blob, separator, remainder = data.partition(b"\r\n\r\n")
+        if not separator:
+            # No body marker, parse what we got.
+            return data.decode("utf-8", errors="ignore")
+
+        header_text = header_blob.decode("iso-8859-1", errors="ignore")
+        content_length = 0
+        for line in header_text.split("\r\n")[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key.strip().lower() == "content-length":
+                try:
+                    content_length = int(value.strip())
+                except Exception:
+                    raise ValueError("Invalid Content-Length")
+                break
+
+        if content_length < 0:
+            raise ValueError("Invalid Content-Length")
+        if content_length > self.MAX_REQUEST_BODY_BYTES:
+            raise ValueError("Payload Too Large")
+
+        while len(remainder) < content_length:
+            chunk = conn.recv(
+                min(
+                    self.REQUEST_RECV_CHUNK_SIZE,
+                    content_length - len(remainder),
+                )
+            )
+            if not chunk:
+                break
+            remainder += chunk
+
+        if len(remainder) < content_length:
+            raise ValueError("Incomplete request body")
+
+        body_blob = remainder[:content_length] if content_length else remainder
+        request_blob = header_blob + b"\r\n\r\n" + body_blob
+        return request_blob.decode("utf-8", errors="ignore")
+
+    def handle_client(self, conn, addr):
+        with conn:
+            try:
+                request = self._recv_http_request(conn)
+                if not request:
+                    return
+                response = self.process_request(request)
+                conn.sendall(response)
+            except ValueError as e:
+                error_response = self.build_response(
+                    400, json.dumps({"status": "error", "message": str(e)})
+                )
+                conn.sendall(error_response)
+            except Exception as e:
+                error_response = self.build_response(
+                    500, json.dumps({"status": "error", "message": str(e)})
+                )
+                conn.sendall(error_response)
+
+    def task(self):
+        while not self.stop_event.is_set():
+            try:
+                pass
+            except Exception as e:
+                print("API() -> task()", e)
+            finally:
+                self.stop_event.wait(5)
+
+    def parse_request(self, request):
+        lines = request.split("\r\n")
+        method, full_path, _ = lines[0].split()
+        path = full_path.split("?", 1)[0]
+        body = request.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in request else ""
+        return method, path, body
+
+    def build_response(self, status_code, body, headers=None):
+        status_message = self.STATUS_MESSAGES.get(status_code, "Unknown")
+        response_headers = (
+            f"HTTP/1.1 {status_code} {status_message}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body.encode())}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+        )
+        if headers:
+            for key, value in headers.items():
+                response_headers += f"{key}: {value}\r\n"
+        response_headers += "\r\n"
+        return (response_headers + body).encode()
+
+    def normalize_target_item(self, item, require_id=False):
+        if not isinstance(item, dict):
+            raise ValueError("Invalid target body")
+        output = dict(item)
+
+        if require_id:
+            try:
+                output["id"] = int(output.get("id"))
+            except Exception:
+                raise ValueError("Invalid target id")
+
+        network = str(output.get("network", "")).strip()
+        if not self.REGEX_IPV4_CIDR.match(network):
+            raise ValueError("Invalid CIDR format")
+        try:
+            network_obj = ipaddress.ip_network(network, strict=False)
+        except Exception:
+            raise ValueError("Invalid CIDR format")
+        if not isinstance(network_obj, ipaddress.IPv4Network):
+            raise ValueError("Only IPv4 CIDR is supported")
+        output["network"] = str(network_obj)
+
+        target_type = str(output.get("type", "")).strip().lower()
+        if target_type not in self.VALID_TARGET_TYPES:
+            raise ValueError("Invalid type. Use common, not_common or full")
+        output["type"] = target_type
+
+        proto = str(output.get("proto", "")).strip().lower()
+        if proto == "stcp":
+            proto = "sctp"
+        if proto not in self.VALID_TARGET_PROTOS:
+            allowed = ", ".join(sorted(self.VALID_TARGET_PROTOS))
+            raise ValueError(f"Invalid proto. Use {allowed}")
+        output["proto"] = proto
+
+        try:
+            timesleep = float(output.get("timesleep", 1.0))
+        except Exception:
+            raise ValueError("Invalid timesleep")
+        if timesleep < 0:
+            raise ValueError("timesleep must be >= 0")
+        output["timesleep"] = timesleep
+
+        target_status = str(output.get("status", "active")).strip().lower()
+        if target_status not in self.VALID_TARGET_STATUSES:
+            allowed = ", ".join(sorted(self.VALID_TARGET_STATUSES))
+            raise ValueError(f"Invalid status. Use {allowed}")
+        output["status"] = target_status
+
+        port_config = normalize_target_port_config(output, proto=proto)
+        output["port_mode"] = port_config["port_mode"]
+        output["port_start"] = port_config["port_start"]
+        output["port_end"] = port_config["port_end"]
+
+        return output
+
+    def normalize_target_action(self, item):
+        if not isinstance(item, dict):
+            raise ValueError("Invalid target action body")
+        output = dict(item)
+
+        try:
+            output["id"] = int(output.get("id"))
+        except Exception:
+            raise ValueError("Invalid target id")
+
+        action = str(output.get("action", "")).strip().lower()
+        if action not in {"start", "restart", "stop", "delete"}:
+            raise ValueError("Invalid action. Use start, restart, stop or delete")
+        output["action"] = action
+
+        output["clean_results"] = bool(output.get("clean_results", True))
+        return output
+
+    def process_request(self, request):
+        method, path, body = self.parse_request(request)
+        response = self.build_response(500, json.dumps({"status": "none"}))
+        try:
+            if path == "/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps(
+                            {
+                                "count_ports": self.db.count_ports(),
+                                "count_banners": self.db.count_banners(),
+                                "count_targets": self.db.count_targets(),
+                            }
+                        ),
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/protocols/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": sorted(self.VALID_TARGET_PROTOS)})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/targets/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_targets()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/ports/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_ports()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/ports/udp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_ports_where_udp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/ports/tcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_ports_where_tcp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/ports/icmp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_ports_where_icmp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/ports/sctp/" or path == "/count/ports/stcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_ports_where_sctp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/count/banners/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"count": self.db.count_banners()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/targets/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_targets()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/target/":
+                if method == "POST":
+                    item = self.normalize_target_item(json.loads(body))
+                    self.db.insert_targets(data=item)
+                    response = self.build_response(200, json.dumps(item))
+                elif method == "PUT":
+                    item = self.normalize_target_item(json.loads(body), require_id=True)
+                    self.db.update_targets(data=item)
+                    response = self.build_response(200, json.dumps(item))
+                elif method == "DELETE":
+                    item = json.loads(body)
+                    item["id"] = int(item["id"])
+                    self.db.delete_target(data=item)
+                    response = self.build_response(200, json.dumps(item))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/target/action/":
+                if method == "POST":
+                    item = self.normalize_target_action(json.loads(body))
+                    current_target = self.db.select_target_by_id(item["id"])
+                    if not current_target:
+                        response = self.build_response(
+                            404, json.dumps({"status": "Target not found"})
+                        )
+                    else:
+                        action = item["action"]
+                        target_id = item["id"]
+                        clean_results = bool(item.get("clean_results", True))
+                        try:
+                            current_progress = float(
+                                current_target.get("progress", 0.0) or 0.0
+                            )
+                        except Exception:
+                            current_progress = 0.0
+                        if action == "start":
+                            if current_progress >= 100.0:
+                                self.db.set_target_progress(
+                                    data={"id": target_id, "progress": 0.0}
+                                )
+                                self.db.set_target_status(
+                                    data={"id": target_id, "status": "restarting"}
+                                )
+                            else:
+                                self.db.set_target_status(
+                                    data={"id": target_id, "status": "active"}
+                                )
+                        elif action == "restart":
+                            if clean_results:
+                                self.db.clear_target_artifacts(data={"id": target_id})
+                            self.db.set_target_progress(
+                                data={"id": target_id, "progress": 0.0}
+                            )
+                            self.db.set_target_status(
+                                data={"id": target_id, "status": "restarting"}
+                            )
+                        elif action == "stop":
+                            self.db.set_target_status(
+                                data={"id": target_id, "status": "stopped"}
+                            )
+                        elif action == "delete":
+                            self.db.set_target_status(
+                                data={"id": target_id, "status": "stopped"}
+                            )
+                            if clean_results:
+                                self.db.clear_target_artifacts(data={"id": target_id})
+                            self.db.delete_target(data={"id": target_id})
+                        response = self.build_response(
+                            200,
+                            json.dumps(
+                                {
+                                    "status": "200",
+                                    "action": action,
+                                    "id": target_id,
+                                    "target": self.db.select_target_by_id(target_id),
+                                }
+                            ),
+                        )
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "POST, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/ports/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ports()}),
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/ports/udp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ports_where_udp()}),
+                    )
+                elif method == "DELETE":
+                    self.db.delete_ports_where_udp()
+                    response = self.build_response(200, json.dumps({"status": "200"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/ports/tcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ports_where_tcp()}),
+                    )
+                elif method == "DELETE":
+                    self.db.delete_ports_where_tcp()
+                    response = self.build_response(200, json.dumps({"status": "200"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/ports/icmp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ports_where_icmp()}),
+                    )
+                elif method == "DELETE":
+                    self.db.delete_ports_where_icmp()
+                    response = self.build_response(200, json.dumps({"status": "200"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/ports/sctp/" or path == "/ports/stcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ports_where_sctp()}),
+                    )
+                elif method == "DELETE":
+                    self.db.delete_ports_where_sctp()
+                    response = self.build_response(200, json.dumps({"status": "200"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/tags/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_tags()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/tags/tcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_tags_tcp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/tags/udp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_tags_udp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/tags/icmp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_tags_icmp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/tags/sctp/" or path == "/tags/stcp/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_tags_sctp()})
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/banners/":
+                if method == "GET":
+                    response = self.build_response(
+                        200, json.dumps({"datas": self.db.select_banners()})
+                    )
+                elif method == "DELETE":
+                    self.db.delete_banners()
+                    response = self.build_response(200, json.dumps({"status": "200"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            else:
+                response = self.build_response(404, json.dumps({"status": "404"}))
+        except Exception as e:
+            response = self.build_response(500, json.dumps({"status": str(e)}))
+        finally:
+            return response
+
+
+class TCP(threading.Thread):
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        self.threads = {}
+
+    def stop(self):
+        self.stop_event.set()
+        for identifier, (thread, stop_evt) in self.threads.items():
+            stop_evt.set()
+            thread.join(timeout=2)
+        self.threads.clear()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                current_targets = self.db.select_targets_where_tcp()
+                finished_ids = [
+                    identifier
+                    for identifier, (thread, _stop_evt) in list(self.threads.items())
+                    if not thread.is_alive()
+                ]
+                for finished_id in finished_ids:
+                    _thread, stop_evt = self.threads.pop(finished_id)
+                    stop_evt.set()
+                    print(f"DONE: {finished_id}")
+                current_ids = {target["id"] for target in current_targets}
+                # stop thread
+                obsolete_ids = set(self.threads.keys()) - current_ids
+                for obsolete_id in obsolete_ids:
+                    print(f"STOP: {obsolete_id}")
+                    thread, stop_evt = self.threads.pop(obsolete_id)
+                    stop_evt.set()
+                    thread.join(timeout=2)
+                # start thread
+                for target in current_targets:
+                    identifier = target["id"]
+                    status = str(target.get("status", "active")).strip().lower()
+                    try:
+                        progress = float(target.get("progress", 0.0) or 0.0)
+                    except Exception:
+                        progress = 0.0
+                    if status == "active" and progress >= 100.0:
+                        continue
+                    if status == "restarting" and identifier in self.threads:
+                        print(f"RESTART-STOP: {identifier}")
+                        thread, stop_evt = self.threads.pop(identifier)
+                        stop_evt.set()
+                        thread.join(timeout=2)
+                    if identifier not in self.threads:
+                        stop_evt = threading.Event()
+                        thread = threading.Thread(
+                            target=self.scan,
+                            daemon=True,
+                            kwargs={
+                                "identifier": identifier,
+                                "network": target["network"],
+                                "type_scan": target["type"],
+                                "port_mode": target.get("port_mode", "preset"),
+                                "port_start": target.get("port_start"),
+                                "port_end": target.get("port_end"),
+                                "timesleep": target["timesleep"],
+                                "progress": target["progress"],
+                                "stop_event": stop_evt,
+                            },
+                        )
+                        self.threads[identifier] = (thread, stop_evt)
+                        thread.start()
+                        print(f"START: {identifier}")
+                        if status == "restarting":
+                            self.db.set_target_status(
+                                data={"id": identifier, "status": "active"}
+                            )
+                            print(f"RESTART-START: {identifier}")
+                    self.stop_event.wait(1)
+            except Exception as e:
+                print(f"TCP() -> run(): {e}")
+            finally:
+                self.stop_event.wait(5)
+
+    def scan(
+        self,
+        identifier: int,
+        network: str,
+        type_scan: str,
+        port_mode: str,
+        port_start,
+        port_end,
+        timesleep: float,
+        progress: float,
+        stop_event: threading.Event,
+    ):
+        network_obj: ipaddress.IPv4Network = ipaddress.IPv4Network(
+            network, strict=False
+        )
+        ips = [ip.exploded for ip in network_obj.hosts()]
+        len_ips = len(ips)
+        ports = resolve_target_ports(
+            type_scan=type_scan,
+            port_mode=port_mode,
+            port_start=port_start,
+            port_end=port_end,
+        )
+        len_ports = len(ports)
+        if len_ips == 0 or len_ports == 0:
+            self.db.targets_progress(
+                data={
+                    "id": identifier,
+                    "progress": 100.0,
+                    "proto": "tcp",
+                }
+            )
+            return
+        total_combinations = len_ips * len_ports
+        start_index = int((progress / 100.0) * total_combinations)
+        current_combination = 0
+        host_offset = identifier % len_ips
+        for i_port, port in enumerate(ports):
+            try:
+                if stop_event.is_set():
+                    raise BreakLoop
+                for hop in range(len_ips):
+                    ip = ips[(host_offset + i_port + hop) % len_ips]
+                    if current_combination < start_index:
+                        current_combination += 1
+                        continue
+                    if progress >= 100.0:
+                        raise BreakLoop
+                    try:
+                        self.stop_event.wait(timesleep)
+                        if stop_event.is_set():
+                            raise BreakLoop
+                        result = self.tcp(ip, port)
+                        if result["state"] == "OPEN":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "tcp",
+                                    "state": "open",
+                                },
+                            )
+                            self.db.insert_tags(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "tcp",
+                                    "key": "time_ms",
+                                    "value": result["tiempo_ms"],
+                                },
+                            )
+                        elif result["state"] == "FILTERED":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "tcp",
+                                    "state": "filtered",
+                                },
+                            )
+                    except BreakLoop:
+                        print("FIN", network)
+                        raise
+                    except Exception as e:
+                        print("TCP() -> scan()", e)
+
+                    finally:
+                        current_combination += 1
+                        progress = (current_combination / total_combinations) * 100
+                        self.db.targets_progress(
+                            data={
+                                "id": identifier,
+                                "progress": progress,
+                                "proto": "tcp",
+                            }
+                        )
+            except BreakLoop:
+                break
+
+    def tcp(self, host, port, timeout=2):
+        resultado = {
+            "protocolo": "TCP",
+            "host": host,
+            "port": port,
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+        }
+        try:
+            inicio = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            bind_source_ip(sock)
+            sock.settimeout(timeout)
+
+            conexion = sock.connect_ex((host, port))
+            fin = time.time()
+
+            resultado["tiempo_ms"] = round((fin - inicio) * 1000, 2)
+
+            if conexion == 0:
+                resultado["state"] = "OPEN"
+            else:
+                resultado["state"] = "CLOSED"
+        except socket.timeout:
+            resultado["state"] = "FILTERED"
+        except Exception as e:
+            resultado["state"] = "ERROR"
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+
+        return resultado
+
+
+class UDP(threading.Thread):
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        self.threads = {}
+
+    def stop(self):
+        self.stop_event.set()
+        for identifier, (thread, stop_evt) in self.threads.items():
+            stop_evt.set()
+            thread.join(timeout=2)
+        self.threads.clear()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                current_targets = self.db.select_targets_where_udp()
+                finished_ids = [
+                    identifier
+                    for identifier, (thread, _stop_evt) in list(self.threads.items())
+                    if not thread.is_alive()
+                ]
+                for finished_id in finished_ids:
+                    _thread, stop_evt = self.threads.pop(finished_id)
+                    stop_evt.set()
+                    print(f"DONE: {finished_id}")
+                current_ids = {target["id"] for target in current_targets}
+                obsolete_ids = set(self.threads.keys()) - current_ids
+                for obsolete_id in obsolete_ids:
+                    print(f"STOP: {obsolete_id}")
+                    thread, stop_evt = self.threads.pop(obsolete_id)
+                    stop_evt.set()
+                    thread.join(timeout=2)
+                for target in current_targets:
+                    identifier = target["id"]
+                    status = str(target.get("status", "active")).strip().lower()
+                    try:
+                        progress = float(target.get("progress", 0.0) or 0.0)
+                    except Exception:
+                        progress = 0.0
+                    if status == "active" and progress >= 100.0:
+                        continue
+                    if status == "restarting" and identifier in self.threads:
+                        print(f"RESTART-STOP: {identifier}")
+                        thread, stop_evt = self.threads.pop(identifier)
+                        stop_evt.set()
+                        thread.join(timeout=2)
+                    if identifier not in self.threads:
+                        stop_evt = threading.Event()
+                        thread = threading.Thread(
+                            target=self.scan,
+                            daemon=True,
+                            kwargs={
+                                "identifier": identifier,
+                                "network": target["network"],
+                                "type_scan": target["type"],
+                                "port_mode": target.get("port_mode", "preset"),
+                                "port_start": target.get("port_start"),
+                                "port_end": target.get("port_end"),
+                                "timesleep": target["timesleep"],
+                                "progress": target["progress"],
+                                "stop_event": stop_evt,
+                            },
+                        )
+                        self.threads[identifier] = (thread, stop_evt)
+                        thread.start()
+                        print(f"START: {identifier}")
+                        if status == "restarting":
+                            self.db.set_target_status(
+                                data={"id": identifier, "status": "active"}
+                            )
+                            print(f"RESTART-START: {identifier}")
+                    self.stop_event.wait(1)
+            except Exception as e:
+                print("UDP() -> run()", e)
+            finally:
+                self.stop_event.wait(5)
+
+    def scan(
+        self,
+        identifier: int,
+        network: str,
+        type_scan: str,
+        port_mode: str,
+        port_start,
+        port_end,
+        timesleep: float,
+        progress: float,
+        stop_event: threading.Event,
+    ):
+        network_obj = ipaddress.IPv4Network(network, strict=False)
+        ips = [ip.exploded for ip in network_obj.hosts()]
+        len_ips = len(ips)
+        ports = resolve_target_ports(
+            type_scan=type_scan,
+            port_mode=port_mode,
+            port_start=port_start,
+            port_end=port_end,
+        )
+        len_ports = len(ports)
+        if len_ips == 0 or len_ports == 0:
+            self.db.targets_progress(
+                data={
+                    "id": identifier,
+                    "progress": 100.0,
+                    "proto": "udp",
+                }
+            )
+            return
+        total_combinations = len_ips * len_ports
+        start_index = int((progress / 100.0) * total_combinations)
+        current_combination = 0
+        host_offset = identifier % len_ips
+        for i_port, port in enumerate(ports):
+            try:
+                if stop_event.is_set():
+                    raise BreakLoop
+                for hop in range(len_ips):
+                    ip = ips[(host_offset + i_port + hop) % len_ips]
+                    if current_combination < start_index:
+                        current_combination += 1
+                        continue
+                    if progress >= 100.0:
+                        raise BreakLoop
+                    try:
+                        self.stop_event.wait(timesleep)
+                        if stop_event.is_set():
+                            raise BreakLoop
+                        result = self.udp(ip, port)
+                        if result["state"] == "OPEN":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "udp",
+                                    "state": "open",
+                                },
+                            )
+                            self.db.insert_tags(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "udp",
+                                    "key": "time_ms",
+                                    "value": result["tiempo_ms"],
+                                },
+                            )
+                        elif result["state"] == "FILTERED":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "udp",
+                                    "state": "filtered",
+                                },
+                            )
+                    except BreakLoop:
+                        print("FIN", network)
+                        raise
+                    except Exception as e:
+                        print("UDP() -> scan()", e)
+                    finally:
+                        current_combination += 1
+                        progress = (current_combination / total_combinations) * 100
+                        self.db.targets_progress(
+                            data={
+                                "id": identifier,
+                                "progress": progress,
+                                "proto": "udp",
+                            }
+                        )
+            except BreakLoop:
+                break
+
+    def udp(self, host, port, timeout=2):
+        resultado = {
+            "protocolo": "UDP",
+            "host": host,
+            "port": port,
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+        }
+        sock = None
+        try:
+            inicio = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            bind_source_ip(sock)
+            sock.settimeout(timeout)
+            sock.sendto(b"", (host, port))
+            try:
+                sock.recvfrom(1024)
+                fin = time.time()
+                resultado["state"] = "OPEN"
+            except socket.timeout:
+                fin = time.time()
+                resultado["state"] = "FILTERED"
+            except Exception as e:
+                fin = time.time()
+                resultado["state"] = "ERROR"
+                print("UDP() -> udp()", e)
+
+            resultado["tiempo_ms"] = round((fin - inicio) * 1000, 2)
+
+        except Exception as e:
+            resultado["state"] = "ERROR"
+            print("UDP() -> udp()", e)
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+
+        return resultado
+
+
+class SCTP(threading.Thread):
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        self.threads = {}
+        self.enabled = supports_sctp()
+        self.proto_number = getattr(socket, "IPPROTO_SCTP", None)
+        self.socket_types = [("stream", socket.SOCK_STREAM)]
+        sock_seqpacket = getattr(socket, "SOCK_SEQPACKET", None)
+        if sock_seqpacket is not None:
+            self.socket_types.append(("seqpacket", sock_seqpacket))
+
+    def stop(self):
+        self.stop_event.set()
+        for identifier, (thread, stop_evt) in self.threads.items():
+            stop_evt.set()
+            thread.join(timeout=2)
+        self.threads.clear()
+
+    def run(self):
+        if not self.enabled:
+            print(
+                "SCTP() -> native sockets unavailable, using fallback host discovery mode"
+            )
+        while not self.stop_event.is_set():
+            try:
+                current_targets = self.db.select_targets_where_sctp()
+                finished_ids = [
+                    identifier
+                    for identifier, (thread, _stop_evt) in list(self.threads.items())
+                    if not thread.is_alive()
+                ]
+                for finished_id in finished_ids:
+                    _thread, stop_evt = self.threads.pop(finished_id)
+                    stop_evt.set()
+                    print(f"DONE: {finished_id}")
+                current_ids = {target["id"] for target in current_targets}
+                obsolete_ids = set(self.threads.keys()) - current_ids
+                for obsolete_id in obsolete_ids:
+                    print(f"STOP: {obsolete_id}")
+                    thread, stop_evt = self.threads.pop(obsolete_id)
+                    stop_evt.set()
+                    thread.join(timeout=2)
+                for target in current_targets:
+                    identifier = target["id"]
+                    status = str(target.get("status", "active")).strip().lower()
+                    try:
+                        progress = float(target.get("progress", 0.0) or 0.0)
+                    except Exception:
+                        progress = 0.0
+                    if status == "active" and progress >= 100.0:
+                        continue
+                    if status == "restarting" and identifier in self.threads:
+                        print(f"RESTART-STOP: {identifier}")
+                        thread, stop_evt = self.threads.pop(identifier)
+                        stop_evt.set()
+                        thread.join(timeout=2)
+                    if identifier not in self.threads:
+                        stop_evt = threading.Event()
+                        thread = threading.Thread(
+                            target=self.scan,
+                            daemon=True,
+                            kwargs={
+                                "identifier": identifier,
+                                "network": target["network"],
+                                "type_scan": target["type"],
+                                "port_mode": target.get("port_mode", "preset"),
+                                "port_start": target.get("port_start"),
+                                "port_end": target.get("port_end"),
+                                "timesleep": target["timesleep"],
+                                "progress": target["progress"],
+                                "stop_event": stop_evt,
+                            },
+                        )
+                        self.threads[identifier] = (thread, stop_evt)
+                        thread.start()
+                        print(f"START: {identifier}")
+                        if status == "restarting":
+                            self.db.set_target_status(
+                                data={"id": identifier, "status": "active"}
+                            )
+                            print(f"RESTART-START: {identifier}")
+                    self.stop_event.wait(1)
+            except Exception as e:
+                print("SCTP() -> run()", e)
+            finally:
+                self.stop_event.wait(5)
+
+    def _record_host_discovery(self, ip: str, state: str, evidence: dict | None = None):
+        state_value = "open" if str(state).upper() == "OPEN" else "filtered"
+        self.db.insert_port(
+            data={
+                "ip": ip,
+                "port": 0,
+                "proto": "sctp",
+                "state": state_value,
+            }
+        )
+        if not evidence:
+            return
+        if evidence.get("tiempo_ms") is not None:
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": 0,
+                    "proto": "sctp",
+                    "key": "host_discovery_time_ms",
+                    "value": evidence.get("tiempo_ms"),
+                }
+            )
+        if evidence.get("method"):
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": 0,
+                    "proto": "sctp",
+                    "key": "host_discovery_method",
+                    "value": evidence.get("method"),
+                }
+            )
+        if evidence.get("probe_port") is not None:
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": 0,
+                    "proto": "sctp",
+                    "key": "host_discovery_probe_port",
+                    "value": evidence.get("probe_port"),
+                }
+            )
+
+    def _fallback_host_probe(self, host: str, timeout=1.0) -> dict:
+        probe = tcp_reachability_probe(host=host, timeout=timeout)
+        probe["method"] = "sctp_fallback_tcp_connect"
+        return probe
+
+    def _scan_hosts_without_sctp(
+        self,
+        identifier: int,
+        ips: list,
+        progress: float,
+        stop_event: threading.Event,
+    ):
+        total_hosts = len(ips)
+        if total_hosts == 0:
+            self.db.targets_progress(
+                data={
+                    "id": identifier,
+                    "progress": 100.0,
+                    "proto": "sctp",
+                }
+            )
+            return
+
+        start_index = int((progress / 100.0) * total_hosts)
+        current_index = 0
+        for ip in ips:
+            try:
+                if current_index < start_index:
+                    current_index += 1
+                    continue
+                if progress >= 100.0 or stop_event.is_set():
+                    raise BreakLoop
+                probe = self._fallback_host_probe(ip, timeout=0.9)
+                if probe["state"] == "OPEN":
+                    self._record_host_discovery(ip=ip, state="OPEN", evidence=probe)
+                elif probe["state"] == "FILTERED":
+                    self._record_host_discovery(ip=ip, state="FILTERED", evidence=probe)
+            except BreakLoop:
+                break
+            except Exception as e:
+                print("SCTP() -> _scan_hosts_without_sctp()", e)
+            finally:
+                current_index += 1
+                progress = (current_index / total_hosts) * 100
+                self.db.targets_progress(
+                    data={
+                        "id": identifier,
+                        "progress": progress,
+                        "proto": "sctp",
+                    }
+                )
+
+    def scan(
+        self,
+        identifier: int,
+        network: str,
+        type_scan: str,
+        port_mode: str,
+        port_start,
+        port_end,
+        timesleep: float,
+        progress: float,
+        stop_event: threading.Event,
+    ):
+        network_obj = ipaddress.IPv4Network(network, strict=False)
+        ips = [ip.exploded for ip in network_obj.hosts()]
+        if not self.enabled:
+            self._scan_hosts_without_sctp(
+                identifier=identifier,
+                ips=ips,
+                progress=progress,
+                stop_event=stop_event,
+            )
+            return
+        ports = resolve_target_ports(
+            type_scan=type_scan,
+            port_mode=port_mode,
+            port_start=port_start,
+            port_end=port_end,
+        )
+        len_ips = len(ips)
+        len_ports = len(ports)
+        if len_ips == 0 or len_ports == 0:
+            self.db.targets_progress(
+                data={
+                    "id": identifier,
+                    "progress": 100.0,
+                    "proto": "sctp",
+                }
+            )
+            return
+        total_combinations = len_ips * len_ports
+        start_index = int((progress / 100.0) * total_combinations)
+        current_combination = 0
+        host_offset = identifier % len_ips
+        host_open_evidence = {}
+        host_filtered_evidence = {}
+        for i_port, port in enumerate(ports):
+            try:
+                if stop_event.is_set():
+                    raise BreakLoop
+                for hop in range(len_ips):
+                    ip = ips[(host_offset + i_port + hop) % len_ips]
+                    if current_combination < start_index:
+                        current_combination += 1
+                        continue
+                    if progress >= 100.0:
+                        raise BreakLoop
+                    try:
+                        self.stop_event.wait(timesleep)
+                        if stop_event.is_set():
+                            raise BreakLoop
+                        result = self.sctp(ip, port)
+                        if result["state"] == "OPEN":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "sctp",
+                                    "state": "open",
+                                },
+                            )
+                            self.db.insert_tags(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "sctp",
+                                    "key": "time_ms",
+                                    "value": result["tiempo_ms"],
+                                },
+                            )
+                            self.db.insert_tags(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "sctp",
+                                    "key": "socket_type",
+                                    "value": result["socket_type"],
+                                },
+                            )
+                            if ip not in host_open_evidence:
+                                host_open_evidence[ip] = {
+                                    "tiempo_ms": result.get("tiempo_ms"),
+                                    "method": f"sctp_native_{result.get('socket_type', 'unknown')}",
+                                    "probe_port": port,
+                                }
+                        elif result["state"] == "CLOSED":
+                            if ip not in host_open_evidence:
+                                host_open_evidence[ip] = {
+                                    "tiempo_ms": result.get("tiempo_ms"),
+                                    "method": f"sctp_native_{result.get('socket_type', 'unknown')}",
+                                    "probe_port": port,
+                                }
+                        elif result["state"] == "FILTERED":
+                            self.db.insert_port(
+                                data={
+                                    "ip": ip,
+                                    "port": port,
+                                    "proto": "sctp",
+                                    "state": "filtered",
+                                },
+                            )
+                            if ip not in host_open_evidence and ip not in host_filtered_evidence:
+                                host_filtered_evidence[ip] = {
+                                    "tiempo_ms": result.get("tiempo_ms"),
+                                    "method": "sctp_native_filtered",
+                                    "probe_port": port,
+                                }
+                    except BreakLoop:
+                        print("FIN", network)
+                        raise
+                    except Exception as e:
+                        print("SCTP() -> scan()", e)
+                    finally:
+                        current_combination += 1
+                        progress = (current_combination / total_combinations) * 100
+                        self.db.targets_progress(
+                            data={
+                                "id": identifier,
+                                "progress": progress,
+                                "proto": "sctp",
+                            }
+                        )
+            except BreakLoop:
+                break
+        for ip in ips:
+            if ip in host_open_evidence:
+                self._record_host_discovery(
+                    ip=ip,
+                    state="OPEN",
+                    evidence=host_open_evidence[ip],
+                )
+            elif ip in host_filtered_evidence:
+                self._record_host_discovery(
+                    ip=ip,
+                    state="FILTERED",
+                    evidence=host_filtered_evidence[ip],
+                )
+
+    def _build_socket(self):
+        for label, sock_type in self.socket_types:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, sock_type, self.proto_number)
+                bind_source_ip(sock)
+                return label, sock
+            except Exception:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+                continue
+        raise OSError("SCTP socket unavailable")
+
+    def sctp(self, host, port, timeout=2):
+        result = {
+            "protocolo": "SCTP",
+            "host": host,
+            "port": port,
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+            "socket_type": "unknown",
+        }
+        sock = None
+        try:
+            socket_type, sock = self._build_socket()
+            result["socket_type"] = socket_type
+            sock.settimeout(timeout)
+            start = time.time()
+            connection = sock.connect_ex((host, port))
+            end = time.time()
+            result["tiempo_ms"] = round((end - start) * 1000, 2)
+            if connection == 0:
+                result["state"] = "OPEN"
+            else:
+                result["state"] = "CLOSED"
+        except socket.timeout:
+            result["state"] = "FILTERED"
+        except Exception:
+            result["state"] = "ERROR"
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+
+        return result
+
+
+class ICMP(threading.Thread):
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        self.threads = {}
+
+    def stop(self):
+        self.stop_event.set()
+        for identifier, (thread, stop_evt) in self.threads.items():
+            stop_evt.set()
+            thread.join(timeout=2)
+        self.threads.clear()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                current_targets = self.db.select_targets_where_icmp()
+                finished_ids = [
+                    identifier
+                    for identifier, (thread, _stop_evt) in list(self.threads.items())
+                    if not thread.is_alive()
+                ]
+                for finished_id in finished_ids:
+                    _thread, stop_evt = self.threads.pop(finished_id)
+                    stop_evt.set()
+                    print(f"DONE: {finished_id}")
+                current_ids = {target["id"] for target in current_targets}
+                obsolete_ids = set(self.threads.keys()) - current_ids
+                for obsolete_id in obsolete_ids:
+                    print(f"STOP: {obsolete_id}")
+                    thread, stop_evt = self.threads.pop(obsolete_id)
+                    stop_evt.set()
+                    thread.join(timeout=2)
+                for target in current_targets:
+                    identifier = target["id"]
+                    status = str(target.get("status", "active")).strip().lower()
+                    try:
+                        progress = float(target.get("progress", 0.0) or 0.0)
+                    except Exception:
+                        progress = 0.0
+                    if status == "active" and progress >= 100.0:
+                        continue
+                    if status == "restarting" and identifier in self.threads:
+                        print(f"RESTART-STOP: {identifier}")
+                        thread, stop_evt = self.threads.pop(identifier)
+                        stop_evt.set()
+                        thread.join(timeout=2)
+                    if identifier not in self.threads:
+                        stop_evt = threading.Event()
+                        thread = threading.Thread(
+                            target=self.scan,
+                            daemon=True,
+                            kwargs={
+                                "identifier": identifier,
+                                "network": target["network"],
+                                "timesleep": target["timesleep"],
+                                "progress": target["progress"],
+                                "stop_event": stop_evt,
+                            },
+                        )
+                        self.threads[identifier] = (thread, stop_evt)
+                        thread.start()
+                        print(f"START: {identifier}")
+                        if status == "restarting":
+                            self.db.set_target_status(
+                                data={"id": identifier, "status": "active"}
+                            )
+                            print(f"RESTART-START: {identifier}")
+                    self.stop_event.wait(1)
+            except Exception as e:
+                print("ICMP() -> run()", e)
+            finally:
+                self.stop_event.wait(5)
+
+    def scan(
+        self,
+        identifier: int,
+        network: str,
+        timesleep: float,
+        progress: float,
+        stop_event: threading.Event,
+    ):
+        network_obj = ipaddress.IPv4Network(network, strict=False)
+        ips = [ip.exploded for ip in network_obj.hosts()]
+        total_hosts = len(ips)
+        if total_hosts == 0:
+            self.db.targets_progress(
+                data={
+                    "id": identifier,
+                    "progress": 100.0,
+                    "proto": "icmp",
+                }
+            )
+            return
+
+        start_index = int((progress / 100.0) * total_hosts)
+        current_index = 0
+        for ip in ips:
+            try:
+                if current_index < start_index:
+                    current_index += 1
+                    continue
+                if progress >= 100.0 or stop_event.is_set():
+                    raise BreakLoop
+                try:
+                    self.stop_event.wait(timesleep)
+                    if stop_event.is_set():
+                        raise BreakLoop
+                    result = self.icmp(ip)
+                    if result["state"] == "OPEN":
+                        self.db.insert_port(
+                            data={
+                                "ip": ip,
+                                "port": 0,
+                                "proto": "icmp",
+                                "state": "open",
+                            },
+                        )
+                        self.db.insert_tags(
+                            data={
+                                "ip": ip,
+                                "port": 0,
+                                "proto": "icmp",
+                                "key": "time_ms",
+                                "value": result["tiempo_ms"],
+                            },
+                        )
+                        self.db.insert_tags(
+                            data={
+                                "ip": ip,
+                                "port": 0,
+                                "proto": "icmp",
+                                "key": "probe_method",
+                                "value": result["method"],
+                            },
+                        )
+                        reply_ttl = result.get("reply_ttl")
+                        if isinstance(reply_ttl, int) and 0 < reply_ttl <= 255:
+                            self.db.insert_tags(
+                                data={
+                                    "ip": ip,
+                                    "port": 0,
+                                    "proto": "icmp",
+                                    "key": "reply_ttl",
+                                    "value": str(reply_ttl),
+                                },
+                            )
+                    elif result["state"] == "FILTERED":
+                        self.db.insert_port(
+                            data={
+                                "ip": ip,
+                                "port": 0,
+                                "proto": "icmp",
+                                "state": "filtered",
+                            },
+                        )
+                except BreakLoop:
+                    print("FIN", network)
+                    break
+                except Exception as e:
+                    print("ICMP() -> scan()", e)
+                finally:
+                    current_index += 1
+                    progress = (current_index / total_hosts) * 100
+                    self.db.targets_progress(
+                        data={
+                            "id": identifier,
+                            "progress": progress,
+                            "proto": "icmp",
+                        }
+                    )
+            except BreakLoop:
+                break
+
+    def icmp(self, host, timeout=1.5):
+        try:
+            return self._icmp_raw(host=host, timeout=timeout)
+        except (PermissionError, OSError):
+            # Raw ICMP usually requires elevated privileges.
+            ping_probe = self._icmp_subprocess_ping(host=host, timeout=timeout)
+            if ping_probe:
+                return ping_probe
+            tcp_probe = tcp_reachability_probe(host=host, timeout=min(1.0, timeout))
+            return {
+                "protocolo": "ICMP",
+                "host": host,
+                "port": 0,
+                "state": tcp_probe.get("state", "FILTERED"),
+                "tiempo_ms": tcp_probe.get("tiempo_ms"),
+                "method": tcp_probe.get("method", "tcp_connect_fallback"),
+            }
+        except Exception:
+            ping_probe = self._icmp_subprocess_ping(host=host, timeout=timeout)
+            if ping_probe:
+                return ping_probe
+            return {
+                "protocolo": "ICMP",
+                "host": host,
+                "port": 0,
+                "state": "FILTERED",
+                "tiempo_ms": None,
+                "method": "fallback_unavailable",
+            }
+
+    def _icmp_subprocess_ping(self, host, timeout=1.5):
+        timeout = max(0.4, float(timeout))
+        if sys.platform.startswith("win"):
+            commands = [
+                [
+                    "ping",
+                    "-n",
+                    "1",
+                    "-w",
+                    str(max(250, int(timeout * 1000))),
+                    host,
+                ]
+            ]
+        else:
+            commands = [
+                [
+                    "ping",
+                    "-n",
+                    "-c",
+                    "1",
+                    "-W",
+                    str(max(1, int(round(timeout)))),
+                    host,
+                ],
+                ["ping", "-n", "-c", "1", host],
+            ]
+
+        for command in commands:
+            start = time.time()
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(timeout + 0.6, 1.2),
+                    check=False,
+                )
+                end = time.time()
+                if completed.returncode == 0:
+                    state = "OPEN"
+                elif completed.returncode == 1:
+                    state = "FILTERED"
+                else:
+                    continue
+                return {
+                    "protocolo": "ICMP",
+                    "host": host,
+                    "port": 0,
+                    "state": state,
+                    "tiempo_ms": round((end - start) * 1000, 2),
+                    "method": "ping_subprocess",
+                }
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                end = time.time()
+                return {
+                    "protocolo": "ICMP",
+                    "host": host,
+                    "port": 0,
+                    "state": "FILTERED",
+                    "tiempo_ms": round((end - start) * 1000, 2),
+                    "method": "ping_subprocess",
+                }
+            except Exception:
+                continue
+        return None
+
+    def _icmp_raw(self, host, timeout=1.5):
+        result = {
+            "protocolo": "ICMP",
+            "host": host,
+            "port": 0,
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+            "method": "raw",
+            "reply_ttl": None,
+        }
+
+        sock = None
+        try:
+            ident = threading.get_ident() & 0xFFFF
+            seq = int(time.time() * 1000) & 0xFFFF
+            payload = b"PortHoundICMP-" + str(int(time.time() * 1000)).encode(
+                "ascii",
+                errors="ignore",
+            )
+            header = bytes(
+                [
+                    8,
+                    0,
+                    0,
+                    0,
+                    (ident >> 8) & 0xFF,
+                    ident & 0xFF,
+                    (seq >> 8) & 0xFF,
+                    seq & 0xFF,
+                ]
+            )
+            checksum = icmp_checksum(header + payload)
+            packet = bytes(
+                [
+                    8,
+                    0,
+                    (checksum >> 8) & 0xFF,
+                    checksum & 0xFF,
+                    (ident >> 8) & 0xFF,
+                    ident & 0xFF,
+                    (seq >> 8) & 0xFF,
+                    seq & 0xFF,
+                ]
+            ) + payload
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            bind_source_ip(sock)
+            sock.settimeout(timeout)
+            start = time.time()
+            sock.sendto(packet, (host, 0))
+            deadline = start + timeout
+
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise socket.timeout()
+                sock.settimeout(remaining)
+                recv_data, addr = sock.recvfrom(1024)
+                if addr[0] != host or len(recv_data) < 28:
+                    continue
+                ip_header_len = (recv_data[0] & 0x0F) * 4
+                if len(recv_data) < ip_header_len + 8:
+                    continue
+                if len(recv_data) >= 9:
+                    try:
+                        result["reply_ttl"] = int(recv_data[8])
+                    except Exception:
+                        result["reply_ttl"] = None
+                icmp_hdr = recv_data[ip_header_len : ip_header_len + 8]
+                icmp_type = icmp_hdr[0]
+                recv_ident = (icmp_hdr[4] << 8) | icmp_hdr[5]
+                recv_seq = (icmp_hdr[6] << 8) | icmp_hdr[7]
+                if icmp_type == 0 and recv_ident == ident and recv_seq == seq:
+                    end = time.time()
+                    result["state"] = "OPEN"
+                    result["tiempo_ms"] = round((end - start) * 1000, 2)
+                    return result
+                if icmp_type == 3:
+                    end = time.time()
+                    result["state"] = "FILTERED"
+                    result["tiempo_ms"] = round((end - start) * 1000, 2)
+                    return result
+        except socket.timeout:
+            result["state"] = "FILTERED"
+            result["tiempo_ms"] = round(timeout * 1000, 2)
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except:
+                pass
+        return result
+
+
+class BannerUDP(threading.Thread):
+    BANNERS = BANNER_UDP_PROBES
+    READ_TIMEOUT = 2.5
+    MAX_UNIQUE_BANNERS_PER_PORT = 3
+    MAX_EMPTY_PROBES = 12
+    MAX_PROBES_PER_PORT = 120
+    MAX_DUPLICATE_RESPONSES = 8
+    MAX_TARGET_WORKERS = 32
+
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        coverage_probes = []
+        for probe_group in UDP_PORT_PROBE_OVERRIDES.values():
+            coverage_probes.extend(probe_group)
+        self.banner_requests = dedupe_probe_payloads(coverage_probes + self.BANNERS)
+
+    def _build_probe_sequence(self, port: int):
+        probes = []
+        probes.extend(UDP_PORT_PROBE_OVERRIDES.get(port, []))
+        probes.extend(self.banner_requests)
+        probes = dedupe_probe_payloads(probes)
+        if self.MAX_PROBES_PER_PORT > 0:
+            probes = probes[: self.MAX_PROBES_PER_PORT]
+        return probes
+
+    def _save_banner_if_new(self, ip: str, port: int, banner: bytes, seen: set):
+        if not banner or banner in seen:
+            return False
+        seen.add(banner)
+        review = review_banner_payload(banner)
+        self.db.insert_banners(
+            data={
+                "ip": ip,
+                "port": port,
+                "proto": "udp",
+                "response": review["payload"],
+                "response_plain": review["text"],
+            },
+        )
+        for row in build_banner_rule_tags(
+            ip=ip,
+            port=port,
+            proto="udp",
+            findings=review["findings"],
+            banner_text=review["text"],
+        ):
+            self.db.insert_tags(data=row)
+        return True
+
+    def run(self):
+        with ThreadPoolExecutor(
+            max_workers=self.MAX_TARGET_WORKERS,
+            thread_name_prefix="banner-udp",
+        ) as pool:
+            while not self.stop_event.is_set():
+                try:
+                    targets = self.db.select_ports_where_udp_for_scan()
+                    futures = [
+                        pool.submit(
+                            self.scan,
+                            target["id"],
+                            target["ip"],
+                            target["port"],
+                            target["progress"],
+                        )
+                        for target in targets
+                    ]
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as worker_error:
+                            print("BannerUDP() -> worker()", worker_error)
+                except Exception as e:
+                    print("BannerUDP() -> run()", e)
+                finally:
+                    self.stop_event.wait(5)
+
+    def scan(self, identifier: int, ip: str, port: int, progress: float):
+        probes = self._build_probe_sequence(port)
+        len_banners = len(probes)
+        if len_banners == 0:
+            self.db.ports_progress(data={"id": identifier, "progress": 100.0})
+            return
+
+        has_saved_banner = self.db.banner_exists(ip=ip, port=port, proto="udp")
+        if progress >= 100.0 and not has_saved_banner:
+            progress = 0.0
+            self.db.ports_progress(data={"id": identifier, "progress": 0.0})
+
+        start_index = min(len_banners, int((progress / 100.0) * len_banners))
+        if start_index >= len_banners:
+            self.db.ports_progress(data={"id": identifier, "progress": 100.0})
+            return
+
+        unique_responses = set()
+        empty_probes = 0
+        duplicate_hits = 0
+        for i, banner in enumerate(
+            probes[start_index:], start=start_index + 1
+        ):
+            if (
+                progress >= 100.0
+                or self.stop_event.is_set()
+                or not self.db.is_port_scan_runnable(identifier)
+            ):
+                break
+            try:
+                result = self.get_banner(ip, port, banner)
+                if result["state"] == "OK" and result["banner"]:
+                    empty_probes = 0
+                    inserted = self._save_banner_if_new(
+                        ip=ip,
+                        port=port,
+                        banner=result["banner"],
+                        seen=unique_responses,
+                    )
+                    if inserted:
+                        duplicate_hits = 0
+                    else:
+                        duplicate_hits += 1
+                        if duplicate_hits >= self.MAX_DUPLICATE_RESPONSES:
+                            break
+                    if len(unique_responses) >= self.MAX_UNIQUE_BANNERS_PER_PORT:
+                        break
+                else:
+                    empty_probes += 1
+                    if unique_responses and empty_probes >= self.MAX_EMPTY_PROBES:
+                        break
+            except Exception as e:
+                print("BannerUDP() -> scan()", e)
+            finally:
+                progress = (i / len_banners) * 100
+                self.db.ports_progress(
+                    data={
+                        "id": identifier,
+                        "progress": progress,
+                    }
+                )
+                self.stop_event.wait(0.2)
+
+    def get_banner(self, ip, port, request_bytes, timeout=None):
+        resultado = {
+            "banner": b"",
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+        }
+        timeout = self.READ_TIMEOUT if timeout is None else timeout
+        sock = None
+
+        try:
+            inicio = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            bind_source_ip(sock)
+            sock.settimeout(timeout)
+            sock.sendto(request_bytes or b"\x00", (ip, port))
+            banner, _ = sock.recvfrom(1024)
+            fin = time.time()
+            resultado["banner"] = banner
+            resultado["tiempo_ms"] = round((fin - inicio) * 1000, 2)
+            resultado["state"] = "OK" if banner else "NOOK"
+        except socket.timeout:
+            resultado["state"] = "NOOK"
+        except Exception:
+            resultado["state"] = "NOOK"
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except:
+                pass
+
+        return resultado
+
+
+class BannerTCP(threading.Thread):
+    BANNERS = BANNER_TCP_PROBES
+    CONNECT_TIMEOUT = 2.0
+    READ_TIMEOUT = 2.5
+    FAVICON_TIMEOUT = 2.5
+    FAVICON_MAX_BYTES = 512 * 1024
+    FAVICON_REDIRECT_LIMIT = 2
+    ENABLE_HTTP_FAVICON_CAPTURE = True
+    MAX_UNIQUE_BANNERS_PER_PORT = 4
+    MAX_EMPTY_PROBES = 10
+    MAX_PROBES_PER_PORT = 140
+    MAX_DUPLICATE_RESPONSES = 10
+    MAX_TARGET_WORKERS = 32
+    FAVICON_LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
+    FAVICON_ATTR_RE = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:.-]*)\s*=\s*([\"'])(.*?)\2")
+
+    def __init__(self, db: DB):
+        threading.Thread.__init__(self)
+        self.db = db
+        self.stop_event = threading.Event()
+        coverage_probes = []
+        for probe_group in TCP_PORT_PROBE_OVERRIDES.values():
+            coverage_probes.extend(probe_group)
+        self.banner_requests = dedupe_probe_payloads(
+            TCP_HTTP_PROBES + coverage_probes + self.BANNERS
+        )
+
+    def _build_probe_sequence(self, port: int):
+        probes = []
+        probes.extend(TCP_PORT_PROBE_OVERRIDES.get(port, []))
+        if port in TCP_HTTP_PORTS:
+            probes.extend(TCP_HTTP_PROBES)
+        probes.extend(self.banner_requests)
+        probes = dedupe_probe_payloads(probes)
+        if self.MAX_PROBES_PER_PORT > 0:
+            probes = probes[: self.MAX_PROBES_PER_PORT]
+        return probes
+
+    def _is_http_banner(self, port: int, review: dict) -> bool:
+        text = str((review or {}).get("text", "") or "")
+        if re.search(r"(?im)^HTTP/[0-9.]+", text):
+            return True
+        if re.search(r"(?im)^Server:\s*", text):
+            return True
+        for finding in (review or {}).get("findings", []) or []:
+            service = str(finding.get("service", "")).strip().lower()
+            protocol = str(finding.get("protocol", "")).strip().upper()
+            if service == "http" or protocol in {"HTTP", "HTTPS"}:
+                return True
+        return int(port) in TCP_HTTP_PORTS
+
+    def _normalize_icon_path(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        lowered = raw.lower()
+        if lowered.startswith(("data:", "javascript:", "mailto:")):
+            return ""
+        if lowered.startswith("//"):
+            return ""
+        if lowered.startswith("http://") or lowered.startswith("https://"):
+            parsed = urlsplit(raw)
+            if parsed.scheme.lower() != "http":
+                return ""
+            path = parsed.path or "/"
+            if parsed.query:
+                path += f"?{parsed.query}"
+            return path
+        if not raw.startswith("/"):
+            return "/" + raw.lstrip("./")
+        return raw
+
+    def _decode_chunked_body(self, body: bytes) -> bytes:
+        if not body:
+            return b""
+        index = 0
+        chunks = []
+        total = len(body)
+        while index < total:
+            line_end = body.find(b"\r\n", index)
+            if line_end < 0:
+                return body
+            size_hex = body[index:line_end].split(b";", 1)[0].strip()
+            try:
+                size = int(size_hex, 16)
+            except Exception:
+                return body
+            index = line_end + 2
+            if size == 0:
+                return b"".join(chunks)
+            if index + size > total:
+                return body
+            chunks.append(body[index : index + size])
+            index += size
+            if body[index : index + 2] == b"\r\n":
+                index += 2
+        return b"".join(chunks)
+
+    def _parse_http_response(self, raw: bytes):
+        if not raw or b"\r\n\r\n" not in raw:
+            return None
+        header_blob, body = raw.split(b"\r\n\r\n", 1)
+        lines = header_blob.decode("iso-8859-1", errors="ignore").split("\r\n")
+        if not lines:
+            return None
+        parts = lines[0].split(" ", 2)
+        if len(parts) < 2:
+            return None
+        try:
+            status_code = int(parts[1])
+        except Exception:
+            return None
+
+        headers = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key and key not in headers:
+                headers[key] = value
+
+        transfer = headers.get("transfer-encoding", "").lower()
+        if "chunked" in transfer:
+            body = self._decode_chunked_body(body)
+        else:
+            try:
+                content_length = int(headers.get("content-length", "").strip())
+            except Exception:
+                content_length = None
+            if content_length is not None and content_length >= 0:
+                body = body[:content_length]
+
+        return {
+            "status": status_code,
+            "headers": headers,
+            "body": body,
+        }
+
+    def _http_get_resource(self, ip: str, port: int, path: str):
+        normalized_path = self._normalize_icon_path(path)
+        if not normalized_path:
+            return None
+
+        host_header = ip if int(port) in {80, 443} else f"{ip}:{port}"
+        redirect_budget = self.FAVICON_REDIRECT_LIMIT
+        current_path = normalized_path
+
+        while redirect_budget >= 0 and current_path:
+            sock = None
+            raw = b""
+            try:
+                request = (
+                    f"GET {current_path} HTTP/1.1\r\n"
+                    f"Host: {host_header}\r\n"
+                    "User-Agent: PortHound/1.0\r\n"
+                    "Accept: image/*,*/*;q=0.8\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii", errors="ignore")
+
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                bind_source_ip(sock)
+                sock.settimeout(self.FAVICON_TIMEOUT)
+                sock.connect((ip, int(port)))
+                sock.sendall(request)
+
+                while len(raw) < self.FAVICON_MAX_BYTES:
+                    chunk = sock.recv(min(4096, self.FAVICON_MAX_BYTES - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
+            except Exception:
+                return None
+            finally:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+
+            response = self._parse_http_response(raw)
+            if not response:
+                return None
+            response["path"] = current_path
+
+            if response["status"] in {301, 302, 303, 307, 308}:
+                redirect_budget -= 1
+                location = response["headers"].get("location", "")
+                next_path = self._normalize_icon_path(location)
+                if not next_path or next_path == current_path:
+                    return response
+                current_path = next_path
+                continue
+            return response
+
+        return None
+
+    def _extract_icon_paths_from_html(self, body: bytes):
+        paths = []
+        text = body.decode("utf-8", errors="ignore")
+        for match in self.FAVICON_LINK_TAG_RE.finditer(text):
+            tag = match.group(0)
+            attrs = {}
+            for attr_match in self.FAVICON_ATTR_RE.finditer(tag):
+                attrs[attr_match.group(1).lower()] = attr_match.group(3).strip()
+            rel_value = attrs.get("rel", "").lower()
+            href_value = attrs.get("href", "")
+            if "icon" not in rel_value:
+                continue
+            icon_path = self._normalize_icon_path(href_value)
+            if icon_path:
+                paths.append(icon_path)
+        return paths
+
+    def _guess_icon_mime(self, path: str, header_mime: str, body: bytes) -> str:
+        mime = str(header_mime or "").split(";", 1)[0].strip().lower()
+        if mime and mime not in {"application/octet-stream", "binary/octet-stream"}:
+            return mime
+
+        blob = body or b""
+        if blob.startswith(b"\x00\x00\x01\x00"):
+            return "image/x-icon"
+        if blob.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if blob.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if blob.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if blob.startswith(b"RIFF") and b"WEBP" in blob[:16]:
+            return "image/webp"
+        if blob.lstrip().startswith(b"<svg") or b"<svg" in blob[:512].lower():
+            return "image/svg+xml"
+
+        lower_path = str(path or "").lower().split("?", 1)[0]
+        if lower_path.endswith(".ico"):
+            return "image/x-icon"
+        if lower_path.endswith(".png"):
+            return "image/png"
+        if lower_path.endswith(".gif"):
+            return "image/gif"
+        if lower_path.endswith(".jpg") or lower_path.endswith(".jpeg"):
+            return "image/jpeg"
+        if lower_path.endswith(".svg"):
+            return "image/svg+xml"
+        if lower_path.endswith(".webp"):
+            return "image/webp"
+        return "application/octet-stream"
+
+    def _is_likely_icon(self, path: str, mime: str, body: bytes) -> bool:
+        if not body:
+            return False
+        if str(mime).lower().startswith("image/"):
+            return True
+        lower_path = str(path or "").lower().split("?", 1)[0]
+        if lower_path.endswith(
+            (".ico", ".png", ".gif", ".jpg", ".jpeg", ".svg", ".webp")
+        ):
+            return True
+        if body.startswith((b"\x00\x00\x01\x00", b"\x89PNG", b"GIF87a", b"GIF89a")):
+            return True
+        if body.startswith(b"\xff\xd8\xff"):
+            return True
+        if b"<svg" in body[:512].lower():
+            return True
+        return False
+
+    def _capture_http_favicon(self, ip: str, port: int):
+        if self.db.favicon_exists(ip=ip, port=port, proto="tcp"):
+            return False
+
+        candidate_paths = ["/favicon.ico"]
+        root_response = self._http_get_resource(ip=ip, port=port, path="/")
+        if root_response and 200 <= root_response.get("status", 0) < 400:
+            content_type = str(root_response.get("headers", {}).get("content-type", ""))
+            if "text/html" in content_type.lower() and root_response.get("body"):
+                candidate_paths.extend(
+                    self._extract_icon_paths_from_html(root_response["body"])
+                )
+
+        visited = set()
+        for path in candidate_paths:
+            normalized_path = self._normalize_icon_path(path)
+            if not normalized_path or normalized_path in visited:
+                continue
+            visited.add(normalized_path)
+            response = self._http_get_resource(ip=ip, port=port, path=normalized_path)
+            if not response or int(response.get("status", 0)) != 200:
+                continue
+            body = bytes(response.get("body", b"") or b"")
+            if not body:
+                continue
+            mime = self._guess_icon_mime(
+                path=normalized_path,
+                header_mime=response.get("headers", {}).get("content-type", ""),
+                body=body,
+            )
+            if not self._is_likely_icon(normalized_path, mime, body):
+                continue
+
+            sha256 = hashlib.sha256(body).hexdigest()
+            self.db.insert_favicon(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "icon_url": normalized_path,
+                    "mime_type": mime,
+                    "icon_blob": body,
+                    "size": len(body),
+                    "sha256": sha256,
+                }
+            )
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "key": "favicon.available",
+                    "value": "true",
+                }
+            )
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "key": "favicon.url",
+                    "value": normalized_path,
+                }
+            )
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "key": "favicon.mime",
+                    "value": mime,
+                }
+            )
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "key": "favicon.size",
+                    "value": str(len(body)),
+                }
+            )
+            self.db.insert_tags(
+                data={
+                    "ip": ip,
+                    "port": int(port),
+                    "proto": "tcp",
+                    "key": "favicon.sha256",
+                    "value": sha256,
+                }
+            )
+            return True
+        return False
+
+    def _save_banner_if_new(self, ip: str, port: int, banner: bytes, seen: set):
+        if not banner or banner in seen:
+            return False
+        seen.add(banner)
+        review = review_banner_payload(banner)
+        self.db.insert_banners(
+            data={
+                "ip": ip,
+                "port": port,
+                "proto": "tcp",
+                "response": review["payload"],
+                "response_plain": review["text"],
+            },
+        )
+        for row in build_banner_rule_tags(
+            ip=ip,
+            port=port,
+            proto="tcp",
+            findings=review["findings"],
+            banner_text=review["text"],
+        ):
+            self.db.insert_tags(data=row)
+        if self.ENABLE_HTTP_FAVICON_CAPTURE and self._is_http_banner(
+            port=port, review=review
+        ):
+            try:
+                self._capture_http_favicon(ip=ip, port=port)
+            except Exception as e:
+                print("BannerTCP() -> favicon_capture()", e)
+        return True
+
+    def run(self):
+        with ThreadPoolExecutor(
+            max_workers=self.MAX_TARGET_WORKERS,
+            thread_name_prefix="banner-tcp",
+        ) as pool:
+            while not self.stop_event.is_set():
+                try:
+                    targets = self.db.select_ports_where_tcp_for_scan()
+                    futures = [
+                        pool.submit(
+                            self.scan,
+                            target["id"],
+                            target["ip"],
+                            target["port"],
+                            target["progress"],
+                        )
+                        for target in targets
+                    ]
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as worker_error:
+                            print("BannerTCP() -> worker()", worker_error)
+                except Exception as e:
+                    print("BannerTCP() -> run()", e)
+                finally:
+                    self.stop_event.wait(5)
+
+    def scan(self, identifier: int, ip: str, port: int, progress: float):
+        probes = self._build_probe_sequence(port)
+        len_banners = len(probes)
+        if len_banners == 0:
+            self.db.ports_progress(data={"id": identifier, "progress": 100.0})
+            return
+
+        has_saved_banner = self.db.banner_exists(ip=ip, port=port, proto="tcp")
+        if progress >= 100.0 and not has_saved_banner:
+            progress = 0.0
+            self.db.ports_progress(data={"id": identifier, "progress": 0.0})
+
+        start_index = min(len_banners, int((progress / 100.0) * len_banners))
+        if start_index >= len_banners:
+            self.db.ports_progress(data={"id": identifier, "progress": 100.0})
+            return
+
+        unique_responses = set()
+        empty_probes = 0
+        duplicate_hits = 0
+
+        # Passive read first for services that send greeting banners immediately.
+        passive_result = self.get_banner(
+            ip=ip,
+            port=port,
+            request_bytes=b"",
+            send_payload=False,
+            connect_timeout=self.CONNECT_TIMEOUT,
+            read_timeout=min(self.READ_TIMEOUT, 0.8),
+        )
+        if passive_result["state"] == "OK":
+            self._save_banner_if_new(
+                ip=ip,
+                port=port,
+                banner=passive_result["banner"],
+                seen=unique_responses,
+            )
+
+        for i, banner in enumerate(
+            probes[start_index:], start=start_index + 1
+        ):
+            if (
+                progress >= 100.0
+                or self.stop_event.is_set()
+                or not self.db.is_port_scan_runnable(identifier)
+            ):
+                break
+            try:
+                result = self.get_banner(ip, port, banner)
+                if result["state"] == "OK" and result["banner"]:
+                    empty_probes = 0
+                    inserted = self._save_banner_if_new(
+                        ip=ip,
+                        port=port,
+                        banner=result["banner"],
+                        seen=unique_responses,
+                    )
+                    if inserted:
+                        duplicate_hits = 0
+                    else:
+                        duplicate_hits += 1
+                        if duplicate_hits >= self.MAX_DUPLICATE_RESPONSES:
+                            break
+                    if len(unique_responses) >= self.MAX_UNIQUE_BANNERS_PER_PORT:
+                        break
+                else:
+                    empty_probes += 1
+                    if unique_responses and empty_probes >= self.MAX_EMPTY_PROBES:
+                        break
+            except Exception as e:
+                print("BannerTCP() -> scan()", e)
+            finally:
+                progress = (i / len_banners) * 100
+                self.db.ports_progress(
+                    data={
+                        "id": identifier,
+                        "progress": progress,
+                    }
+                )
+                self.stop_event.wait(0.2)
+
+    def get_banner(
+        self,
+        ip,
+        port,
+        request_bytes,
+        connect_timeout=None,
+        read_timeout=None,
+        send_payload=True,
+    ):
+        resultado = {
+            "banner": b"",
+            "state": "UNKNOWN",
+            "tiempo_ms": None,
+        }
+        connect_timeout = (
+            self.CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
+        )
+        read_timeout = self.READ_TIMEOUT if read_timeout is None else read_timeout
+        sock = None
+
+        try:
+            inicio = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            bind_source_ip(sock)
+            sock.settimeout(connect_timeout)
+            sock.connect((ip, port))
+            sock.settimeout(read_timeout)
+            if send_payload:
+                sock.sendall(request_bytes or b"\r\n")
+            banner = sock.recv(1024)
+            fin = time.time()
+            resultado["banner"] = banner
+            resultado["tiempo_ms"] = round((fin - inicio) * 1000, 2)
+            resultado["state"] = "OK" if banner else "NOOK"
+        except socket.timeout:
+            resultado["state"] = "NOOK"
+        except Exception:
+            resultado["state"] = "NOOK"
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except:
+                pass
+        return resultado
+
+
+class HTTP(threading.Thread):
+    def __init__(self, lock=None):
+        threading.Thread.__init__(self)
+        self.db_lock = lock if lock else threading.Lock()
+        self.conn = sqlite3.connect(
+            "file::memory:?cache=shared", check_same_thread=False, timeout=10.0
+        )
+        self.stop_event = threading.Event()
+
+    def client_send_http_request(
+        self,
+        path: str,
+        method: str,
+        headers: dict,
+        body: str = "",
+        http_version: str = "HTTP/1.1",
+        port: int = None,
+    ) -> str:
+        host = headers.get("Host")
+        if not host:
+            raise ValueError("El encabezado 'Host' es obligatorio")
+
+        if port is None:
+            port = 443 if headers.get("Host", "").startswith("https") else 80
+
+        request_line = f"{method} {path} {http_version}\r\n"
+        header_lines = "\r\n".join([f"{k}: {v}" for k, v in headers.items()])
+        http_request = f"{request_line}{header_lines}\r\n\r\n{body}"
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            bind_source_ip(s)
+            s.connect((host, port))
+            s.sendall(http_request.encode("utf-8"))
+            response = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+
+        return response.decode("utf-8")
+
+    def client_parse_http_response(self, response: str) -> dict:
+        lines = response.split("\r\n")
+        status_line_parts = lines[0].split(" ", 2)
+        http_version = status_line_parts[0]
+        status_code = status_line_parts[1]
+        status_message = status_line_parts[2] if len(status_line_parts) > 2 else ""
+
+        headers = {}
+        body = ""
+        index = 1
+
+        while index < len(lines) and lines[index]:
+            if ": " in lines[index]:
+                key, value = lines[index].split(": ", 1)
+                headers[key] = value
+            index += 1
+
+        body = "\r\n".join(lines[index + 1 :])
+
+        return {
+            "http_version": http_version,
+            "status_code": status_code,
+            "status_message": status_message,
+            "headers": headers,
+            "body": body,
+        }
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                threads = []
+                targets = self.db_get_targets()
+                for target in targets:
+                    threads.append(
+                        threading.Thread(
+                            target=self.scan,
+                            daemon=True,
+                            kwargs={
+                                "network": target["network"],
+                                "type_scan": target["type"],
+                                "timesleep": target["timesleep"],
+                            },
+                        )
+                    )
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+            except Exception as e:
+                print("HTTP() -> run()", e)
+            finally:
+                self.stop_event.wait(5)
+
+    def scan(self, network: str, type_scan: str, timesleep: float):
+        response = self.client_send_http_request(
+            path="/targets/",
+            method="GET",
+            headers={
+                "Host": "127.0.0.1",
+                "User-Agent": "PortHoundMicroService",
+                "Accept": "*/*",
+                "Connection": "close",
+            },
+            body="",
+            http_version="HTTP/1.1",
+            port=45678,
+        )
+        parsed_response = self.client_parse_http_response(response)
+        print(parsed_response)
+
+    def db_insert(self, table, data):
+        try:
+            self.db_lock.acquire()
+            cursor = self.conn.cursor()
+            if table == "port_open":
+                cursor.execute(
+                    "INSERT OR IGNORE INTO port_open (ip, port, proto) VALUES (?, ?, ?);",
+                    (data["ip"], data["port"], data["proto"]),
+                )
+            elif table == "port_filtered":
+                cursor.execute(
+                    "INSERT OR IGNORE INTO port_filtered (ip, port, proto) VALUES (?, ?, ?);",
+                    (data["ip"], data["port"], data["proto"]),
+                )
+            elif table == "tags":
+                cursor.execute(
+                    "INSERT OR IGNORE INTO tags (ip, port, proto, key, value) VALUES (?, ?, ?, ?, ?);",
+                    (
+                        data["ip"],
+                        data["port"],
+                        data["proto"],
+                        data["key"],
+                        data["value"],
+                    ),
+                )
+            self.conn.commit()
+        except Exception as e:
+            print("HTTP() -> db_insert()", e)
+        finally:
+            self.db_lock.release()
+            cursor.close()
+
+    def db_get_targets(self):
+        output = []
+        try:
+            self.db_lock.acquire()
+            cursor = self.conn.cursor()
+            cursor.execute(f"SELECT * FROM targets WHERE proto='tcp';")
+            column_names = [col[0] for col in cursor.description]
+            output = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+            cursor.close()
+        except Exception as e:
+            print("HTTP() -> db_get_targets()", e)
+        finally:
+            self.db_lock.release()
+            return output
+
+
+if __name__ == "__main__":
+    db = DB()
+    API(host="127.0.0.1", port=45678, db=db).start()
+    TCP(db=db).start()
+    UDP(db=db).start()
+    if "sctp" in TARGET_PROTOS:
+        SCTP(db=db).start()
+    ICMP(db=db).start()
+    BannerTCP(db=db).start()
+    BannerUDP(db=db).start()

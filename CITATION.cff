@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "PortHound"
+message: "If you use this software, please cite it."
+type: software
+authors:
+  - name: "jorgelsc-dev"
+version: "1.0.0"
+date-released: "2025-04-24"
+license: "MIT"
