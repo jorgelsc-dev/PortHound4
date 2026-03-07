@@ -64,6 +64,27 @@ pids/
 
 # Local PKI artifacts
 certs/
+*.pem
+*.key
+*.crt
+*.cer
+*.csr
+*.p12
+*.pfx
+*.der
+*.jks
+*.keystore
+
+# Shell / local env tools
+.direnv/
+.envrc
+
+# Editor temp files
+*~
+*.swp
+*.swo
+*.orig
+*.rej
 
 # OS / editors
 .DS_Store
