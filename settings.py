@@ -56,6 +56,7 @@ TLS_REQUIRE_CLIENT_CERT = _as_bool(
 AGENT_CERT_FILE = str(_env("PORTHOUND_AGENT_CERT", "certs/agent/agent.cert.pem")).strip()
 AGENT_KEY_FILE = str(_env("PORTHOUND_AGENT_KEY", "certs/agent/agent.key.pem")).strip()
 AGENT_ID = str(_env("PORTHOUND_AGENT_ID", "")).strip()
+AGENT_SHARED_KEY = str(_env("PORTHOUND_AGENT_SHARED_KEY", "")).strip()
 AGENT_POLL_SECONDS = max(2, _as_int(_env("PORTHOUND_AGENT_POLL_SECONDS", "8"), 8))
 AGENT_HTTP_TIMEOUT = max(2.0, _as_float(_env("PORTHOUND_AGENT_HTTP_TIMEOUT", "20.0"), 20.0))
 AGENT_TASK_LEASE_SECONDS = max(

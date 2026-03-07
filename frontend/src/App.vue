@@ -56,6 +56,7 @@ export default {
       apiBaseDraft: store.state.apiBase,
       navItems: [
         { label: "Dashboard", to: "/", icon: "mdi-view-dashboard" },
+        { label: "Charts", to: "/charts", icon: "mdi-chart-box-outline" },
         { label: "Map", to: "/map", icon: "mdi-earth" },
         { label: "Explorer", to: "/explorer", icon: "mdi-magnify-expand" },
         { label: "Agents", to: "/agents", icon: "mdi-server-network" },
@@ -63,6 +64,7 @@ export default {
         { label: "Ports", to: "/ports", icon: "mdi-ethernet" },
         { label: "Banners", to: "/banners", icon: "mdi-card-text" },
         { label: "Tags", to: "/tags", icon: "mdi-tag-outline" },
+        { label: "Catalog", to: "/catalog", icon: "mdi-database-edit-outline" },
         { label: "API", to: "/api", icon: "mdi-api" },
       ],
     };

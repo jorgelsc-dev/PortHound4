@@ -236,13 +236,21 @@ class TestWsCloseValidation(unittest.TestCase):
 
 
 class TestClusterSecurityHelpers(unittest.TestCase):
-    def test_normalize_master_base_url_enforces_https(self):
+    def test_normalize_master_base_url_supports_http_and_https(self):
         self.assertEqual(
             app.normalize_master_base_url("master.local:45678"),
+            "http://master.local:45678",
+        )
+        self.assertEqual(
+            app.normalize_master_base_url("http://master.local:45678"),
+            "http://master.local:45678",
+        )
+        self.assertEqual(
             "https://master.local:45678",
+            app.normalize_master_base_url("https://master.local:45678"),
         )
         with self.assertRaises(ValueError):
-            app.normalize_master_base_url("http://master.local:45678")
+            app.normalize_master_base_url("ftp://master.local:45678")
 
     def test_require_agent_mtls(self):
         request_no_cert = framework.Request(
@@ -280,6 +288,55 @@ class TestClusterSecurityHelpers(unittest.TestCase):
         restored = app.ca_oneline_to_pem(one_line)
         self.assertEqual(restored, pem)
 
+    def test_authenticate_cluster_agent_shared_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = tmp_path / "geoip_blocks.seed.jsonl"
+            seed_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "meta",
+                        "format": "porthound.geoip.seed.v1",
+                        "generated_at": "2026-03-04T00:00:00Z",
+                        "rows": 0,
+                        "partial": False,
+                        "selected_rirs": [],
+                        "failed_rirs": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            db.create_tables()
+            credential = db.create_cluster_agent_credential({"agent_id": "agent-auth-unit"})
+            request = framework.Request(
+                method="POST",
+                path="/api/cluster/agent/register",
+                query_string="",
+                headers={"content-type": "application/json"},
+                body=b"{}",
+                client=("127.0.0.1", 0),
+                tls={"enabled": False, "peer_cert": None},
+            )
+            original_db = app.scan_db
+            app.scan_db = db
+            try:
+                auth, auth_error = app.authenticate_cluster_agent(
+                    request,
+                    {
+                        "agent_id": credential["agent_id"],
+                        "agent_key": credential["agent_key"],
+                    },
+                )
+                self.assertIsNone(auth_error)
+                self.assertEqual(auth["agent_id"], credential["agent_id"])
+                self.assertEqual(auth["auth_mode"], "shared_key")
+            finally:
+                app.scan_db = original_db
+                db.conn.close()
+
     def test_build_cluster_agents_snapshot(self):
         with app.cluster_lock:
             original_agents = dict(app.cluster_agents)
@@ -304,6 +361,18 @@ class TestClusterSecurityHelpers(unittest.TestCase):
                 app.cluster_agents.update(original_agents)
                 app.cluster_leases.clear()
                 app.cluster_leases.update(original_leases)
+
+
+class TestChartAnalytics(unittest.TestCase):
+    def test_build_chart_analytics_example_payload_shape(self):
+        payload = app.build_chart_analytics(example=True)
+        self.assertIn("summary", payload)
+        self.assertIn("ports_by_proto", payload)
+        self.assertIn("targets_by_status", payload)
+        self.assertIn("timeline", payload)
+        self.assertIsInstance(payload["ports_by_proto"], list)
+        self.assertIsInstance(payload["targets_by_status"], list)
+        self.assertIsInstance(payload["timeline"], list)
 
 
 class _EmptyBannerDB:
@@ -463,6 +532,220 @@ class TestPortActionHandlers(unittest.TestCase):
                 self.assertEqual(db.select_banners(), [])
             finally:
                 app.scan_db = original_db
+                db.conn.close()
+
+
+class TestCatalogBootstrap(unittest.TestCase):
+    def _build_meta_seed_file(self, directory: Path) -> Path:
+        seed_path = directory / "geoip_blocks.seed.jsonl"
+        seed_path.write_text(
+            json.dumps(
+                {
+                    "kind": "meta",
+                    "format": "porthound.geoip.seed.v1",
+                    "generated_at": "2026-03-04T00:00:00Z",
+                    "rows": 0,
+                    "partial": False,
+                    "selected_rirs": [],
+                    "failed_rirs": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return seed_path
+
+    def test_catalog_tables_bootstrap_from_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = self._build_meta_seed_file(tmp_path)
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            try:
+                db.create_tables()
+                rules = db.select_banner_regex_rules(include_inactive=True)
+                requests = db.select_banner_probe_requests(include_inactive=True)
+                ips = db.select_ip_presets(include_inactive=True)
+            finally:
+                db.conn.close()
+
+            self.assertGreater(len(rules), 0)
+            self.assertGreater(len(requests), 0)
+            self.assertGreater(len(ips), 0)
+            self.assertTrue(any(not row["mutable"] for row in rules))
+            self.assertTrue(any(not row["mutable"] for row in requests))
+            self.assertTrue(any(not row["mutable"] for row in ips))
+
+    def test_builtin_catalog_entries_are_immutable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = self._build_meta_seed_file(tmp_path)
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            try:
+                db.create_tables()
+                builtin_rule = next(
+                    row for row in db.select_banner_regex_rules() if not row["mutable"]
+                )
+                builtin_request = next(
+                    row for row in db.select_banner_probe_requests() if not row["mutable"]
+                )
+                builtin_ip = next(
+                    row for row in db.select_ip_presets() if not row["mutable"]
+                )
+
+                with self.assertRaises(PermissionError):
+                    db.delete_banner_regex_rule({"id": builtin_rule["id"]})
+                with self.assertRaises(PermissionError):
+                    db.delete_banner_probe_request({"id": builtin_request["id"]})
+                with self.assertRaises(PermissionError):
+                    db.delete_ip_preset({"id": builtin_ip["id"]})
+            finally:
+                db.conn.close()
+
+    def test_user_catalog_entries_support_crud(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = self._build_meta_seed_file(tmp_path)
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            try:
+                db.create_tables()
+
+                custom_rule = db.insert_banner_regex_rule(
+                    {
+                        "rule_id": "custom_unit_test_rule",
+                        "label": "Custom Unit Rule",
+                        "pattern": r"UnitTestServer/(?P<version>[0-9.]+)",
+                        "flags": 2,
+                        "category": "test",
+                        "service": "http",
+                        "active": True,
+                    }
+                )
+                self.assertTrue(custom_rule["mutable"])
+                updated_rule = db.update_banner_regex_rule(
+                    {
+                        "id": custom_rule["id"],
+                        "rule_id": "custom_unit_test_rule",
+                        "label": "Custom Unit Rule Updated",
+                        "pattern": r"UnitTestServer/(?P<version>[0-9.]+)",
+                        "flags": 2,
+                        "category": "test",
+                        "service": "http",
+                        "active": False,
+                    }
+                )
+                self.assertFalse(updated_rule["active"])
+
+                custom_request = db.insert_banner_probe_request(
+                    {
+                        "name": "Unit Test TCP Probe",
+                        "proto": "tcp",
+                        "scope": "generic",
+                        "payload_format": "text",
+                        "payload_encoded": "HELLO UNIT TEST\\r\\n",
+                        "description": "test",
+                        "active": True,
+                    }
+                )
+                self.assertTrue(custom_request["mutable"])
+                updated_request = db.update_banner_probe_request(
+                    {
+                        "id": custom_request["id"],
+                        "name": "Unit Test TCP Probe v2",
+                        "proto": "tcp",
+                        "scope": "generic",
+                        "payload_format": "text",
+                        "payload_encoded": "HELLO UNIT TEST v2\\r\\n",
+                        "description": "updated",
+                        "active": False,
+                    }
+                )
+                self.assertFalse(updated_request["active"])
+
+                custom_ip = db.insert_ip_preset(
+                    {
+                        "value": "10.9.9.0/24",
+                        "label": "Unit Test Net",
+                        "description": "test",
+                        "active": True,
+                    }
+                )
+                self.assertTrue(custom_ip["mutable"])
+                updated_ip = db.update_ip_preset(
+                    {
+                        "id": custom_ip["id"],
+                        "value": "10.9.9.0/24",
+                        "label": "Unit Test Net Updated",
+                        "description": "updated",
+                        "active": False,
+                    }
+                )
+                self.assertFalse(updated_ip["active"])
+
+                db.delete_banner_regex_rule({"id": custom_rule["id"]})
+                db.delete_banner_probe_request({"id": custom_request["id"]})
+                db.delete_ip_preset({"id": custom_ip["id"]})
+
+                rules_after = db.select_banner_regex_rules()
+                requests_after = db.select_banner_probe_requests()
+                ips_after = db.select_ip_presets()
+                self.assertFalse(any(row["id"] == custom_rule["id"] for row in rules_after))
+                self.assertFalse(any(row["id"] == custom_request["id"] for row in requests_after))
+                self.assertFalse(any(row["id"] == custom_ip["id"] for row in ips_after))
+            finally:
+                db.conn.close()
+
+
+class TestClusterAgentCredentialStorage(unittest.TestCase):
+    def test_cluster_agent_credentials_crud(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = tmp_path / "geoip_blocks.seed.jsonl"
+            seed_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "meta",
+                        "format": "porthound.geoip.seed.v1",
+                        "generated_at": "2026-03-04T00:00:00Z",
+                        "rows": 0,
+                        "partial": False,
+                        "selected_rirs": [],
+                        "failed_rirs": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            try:
+                db.create_tables()
+                created = db.create_cluster_agent_credential({"agent_id": "agent-crud-unit"})
+                self.assertTrue(created["active"])
+                self.assertTrue(created.get("agent_key"))
+                self.assertTrue(
+                    db.verify_cluster_agent_shared_key(
+                        created["agent_id"],
+                        created["agent_key"],
+                    )
+                )
+
+                listed = db.select_cluster_agent_credentials(include_inactive=True)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(listed[0]["agent_id"], "agent-crud-unit")
+
+                revoked = db.revoke_cluster_agent_credential({"id": created["id"]})
+                self.assertFalse(revoked["active"])
+                self.assertFalse(
+                    db.verify_cluster_agent_shared_key(
+                        created["agent_id"],
+                        created["agent_key"],
+                    )
+                )
+            finally:
                 db.conn.close()
 
 

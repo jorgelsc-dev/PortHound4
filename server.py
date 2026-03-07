@@ -4,7 +4,10 @@ import threading
 import json
 import sqlite3
 import hashlib
+import hmac
+import base64
 import errno
+import secrets
 from os import getenv
 import subprocess
 import sys
@@ -12,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, UTC
 import time
 import ipaddress
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from geoip_seed import (
@@ -29,7 +33,12 @@ from scan_payloads import (
     TCP_PORT_PROBE_OVERRIDES,
     UDP_PORT_PROBE_OVERRIDES,
 )
-from banner_rules import build_banner_rule_tags, review_banner_payload
+from banner_rules import (
+    BANNER_REGEX_RULES,
+    build_banner_rule_tags,
+    review_banner_payload,
+    set_runtime_banner_rules,
+)
 
 
 class BreakLoop(Exception):
@@ -266,17 +275,136 @@ def resolve_target_ports(type_scan: str, port_mode="preset", port_start=None, po
         return range(1, 65535)
     return range(0)
 
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_BANNER_RULES_FILE = PROJECT_ROOT / "data" / "banner_regex_rules.json"
+DEFAULT_BANNER_REQUESTS_FILE = PROJECT_ROOT / "data" / "banner_probe_requests.json"
+DEFAULT_IP_PRESETS_FILE = PROJECT_ROOT / "data" / "ip_presets.json"
+
+PROBE_PAYLOAD_FORMATS = {"text", "hex", "base64"}
+PROBE_REQUEST_SCOPES = {"generic", "http", "port_override"}
+AGENT_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]{3,80}$")
+
+
+def _parse_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on", "y"}:
+        return True
+    if raw in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _safe_read_json_array(file_path: Path, key: str):
+    try:
+        payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = payload.get(key, [])
+    if not isinstance(rows, list):
+        return []
+    return rows
+
+
+def _decode_probe_payload(payload_encoded, payload_format):
+    fmt = str(payload_format or "text").strip().lower()
+    raw_text = str(payload_encoded or "")
+    if fmt not in PROBE_PAYLOAD_FORMATS:
+        raise ValueError("Invalid payload_format. Use text, hex or base64")
+    if fmt == "text":
+        return raw_text.encode("utf-8", errors="ignore")
+    if fmt == "hex":
+        cleaned = "".join(raw_text.split())
+        if cleaned.lower().startswith("0x"):
+            cleaned = cleaned[2:]
+        if len(cleaned) % 2 != 0:
+            raise ValueError("hex payload must contain an even number of characters")
+        try:
+            return bytes.fromhex(cleaned)
+        except Exception as exc:
+            raise ValueError(f"Invalid hex payload: {exc}") from exc
+    try:
+        return base64.b64decode(raw_text.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 payload: {exc}") from exc
+
+
+def _payload_preview(payload: bytes, max_len=180):
+    data = bytes(payload or b"")
+    if not data:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    text = "".join(
+        ch if ch.isprintable() or ch in {"\r", "\n", "\t"} else "?"
+        for ch in text
+    )
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def _normalize_ip_value(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("ip value is required")
+    if "/" in raw:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except Exception:
+            raise ValueError("Invalid IPv4 CIDR value")
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise ValueError("Only IPv4 CIDR values are supported")
+        return network.with_prefixlen
+    try:
+        addr = ipaddress.ip_address(raw)
+    except Exception:
+        raise ValueError("Invalid IPv4 value")
+    if not isinstance(addr, ipaddress.IPv4Address):
+        raise ValueError("Only IPv4 addresses are supported")
+    return str(addr)
+
+
+def _normalize_agent_id(value, generate_if_missing=True):
+    candidate = str(value or "").strip()
+    if not candidate:
+        if not generate_if_missing:
+            raise ValueError("agent_id is required")
+        candidate = f"agent-{secrets.token_hex(4)}"
+    if not AGENT_ID_SAFE_RE.fullmatch(candidate):
+        raise ValueError(
+            "Invalid agent_id. Use 3-80 chars: letters, numbers, '.', '_' or '-'"
+        )
+    return candidate
+
+
+def _hash_agent_shared_key(value):
+    raw = str(value or "").strip()
+    if len(raw) < 16:
+        raise ValueError("agent_key must be at least 16 characters")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 class DB(object):
     def __init__(self, path="Database.db", geoip_seed_path=None):
         self.path = str(path)
         self.geoip_seed_path = str(
             resolve_geoip_seed_path(geoip_seed_path or DEFAULT_GEOIP_SEED_PATH)
         )
+        self.banner_rules_file = Path(DEFAULT_BANNER_RULES_FILE)
+        self.banner_requests_file = Path(DEFAULT_BANNER_REQUESTS_FILE)
+        self.ip_presets_file = Path(DEFAULT_IP_PRESETS_FILE)
         self.conn = sqlite3.connect(
             self.path, check_same_thread=False, timeout=10.0
         )
         self.lock = threading.Lock()
         self.geoip_status_cache = None
+        self.catalog_bootstrap_done = False
 
     def config(self):
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -440,7 +568,10 @@ class DB(object):
                 "WHERE scan_state IS NULL OR trim(scan_state) = '' "
                 "OR lower(scan_state) NOT IN ('active', 'stopped', 'restarting');"
             )
+            self._ensure_catalog_tables(cursor)
+            self._bootstrap_catalog_from_files(cursor)
             self.conn.commit()
+            self._refresh_runtime_banner_rules_locked(cursor=cursor)
             cursor.close()
             cursor = None
             self.geoip_status_cache = sync_geoip_seed_into_db(
@@ -453,6 +584,1320 @@ class DB(object):
             if cursor is not None:
                 cursor.close()
             self.lock.release()
+
+    def _ensure_catalog_tables(self, cursor):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS banner_regex_catalog ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "rule_key TEXT NOT NULL UNIQUE,"
+            "rule_id TEXT NOT NULL,"
+            "label TEXT NOT NULL,"
+            "pattern TEXT NOT NULL,"
+            "flags INTEGER NOT NULL DEFAULT 0,"
+            "category TEXT NOT NULL DEFAULT '',"
+            "service TEXT NOT NULL DEFAULT '',"
+            "protocol TEXT NOT NULL DEFAULT '',"
+            "product TEXT NOT NULL DEFAULT '',"
+            "server TEXT NOT NULL DEFAULT '',"
+            "os TEXT NOT NULL DEFAULT '',"
+            "version TEXT NOT NULL DEFAULT '',"
+            "runtime TEXT NOT NULL DEFAULT '',"
+            "framework TEXT NOT NULL DEFAULT '',"
+            "vendor TEXT NOT NULL DEFAULT '',"
+            "powered_by TEXT NOT NULL DEFAULT '',"
+            "source TEXT NOT NULL DEFAULT 'user',"
+            "mutable INTEGER NOT NULL DEFAULT 1,"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ");"
+        )
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS banner_probe_catalog ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "request_key TEXT NOT NULL UNIQUE,"
+            "name TEXT NOT NULL,"
+            "proto TEXT NOT NULL,"
+            "scope TEXT NOT NULL,"
+            "port INTEGER NOT NULL DEFAULT 0,"
+            "payload_format TEXT NOT NULL DEFAULT 'text',"
+            "payload_encoded TEXT NOT NULL,"
+            "payload BLOB NOT NULL,"
+            "description TEXT NOT NULL DEFAULT '',"
+            "source TEXT NOT NULL DEFAULT 'user',"
+            "mutable INTEGER NOT NULL DEFAULT 1,"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ");"
+        )
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS ip_catalog ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "value TEXT NOT NULL UNIQUE,"
+            "label TEXT NOT NULL DEFAULT '',"
+            "description TEXT NOT NULL DEFAULT '',"
+            "source TEXT NOT NULL DEFAULT 'user',"
+            "mutable INTEGER NOT NULL DEFAULT 1,"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ");"
+        )
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS cluster_agent_credentials ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "agent_id TEXT NOT NULL UNIQUE,"
+            "key_hash TEXT NOT NULL,"
+            "active INTEGER NOT NULL DEFAULT 1,"
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "last_used_at TEXT"
+            ");"
+        )
+
+    def _iter_builtin_banner_rules(self):
+        rows = _safe_read_json_array(self.banner_rules_file, "rules")
+        if not rows:
+            rows = list(BANNER_REGEX_RULES)
+        output = []
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            rule_id = str(row.get("id", "") or row.get("rule_id", "")).strip()
+            if not rule_id:
+                rule_id = f"builtin_rule_{index:04d}"
+            rule_key = str(row.get("rule_key", "")).strip() or rule_id
+            pattern = str(row.get("pattern", "") or "")
+            if not pattern:
+                continue
+            try:
+                flags = int(row.get("flags", 0) or 0)
+            except Exception:
+                flags = 0
+            output.append(
+                {
+                    "rule_key": rule_key,
+                    "rule_id": rule_id,
+                    "label": str(row.get("label", "") or rule_id),
+                    "pattern": pattern,
+                    "flags": flags,
+                    "category": str(row.get("category", "") or ""),
+                    "service": str(row.get("service", "") or ""),
+                    "protocol": str(row.get("protocol", "") or ""),
+                    "product": str(row.get("product", "") or ""),
+                    "server": str(row.get("server", "") or ""),
+                    "os": str(row.get("os", "") or ""),
+                    "version": str(row.get("version", "") or ""),
+                    "runtime": str(row.get("runtime", "") or ""),
+                    "framework": str(row.get("framework", "") or ""),
+                    "vendor": str(row.get("vendor", "") or ""),
+                    "powered_by": str(row.get("powered_by", "") or ""),
+                    "active": 1 if _parse_bool(row.get("active", True), default=True) else 0,
+                }
+            )
+        return output
+
+    def _append_probe_request(
+        self,
+        bucket,
+        seen_keys,
+        proto,
+        scope,
+        port,
+        payload,
+        payload_format="base64",
+        payload_encoded=None,
+        name_prefix="Builtin probe",
+        request_key="",
+        description="",
+        active=True,
+    ):
+        proto = str(proto or "").strip().lower()
+        scope = str(scope or "").strip().lower()
+        if proto not in {"tcp", "udp"} or scope not in PROBE_REQUEST_SCOPES:
+            return
+        port_value = int(port or 0)
+        raw_payload = bytes(payload or b"")
+        key = str(request_key or "").strip()
+        if not key:
+            digest = hashlib.sha256(
+                f"{proto}|{scope}|{port_value}|".encode("utf-8") + raw_payload
+            ).hexdigest()
+            key = f"{proto}_{scope}_{port_value}_{digest[:16]}"
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        fmt = str(payload_format or "base64").strip().lower()
+        encoded = payload_encoded
+        if encoded is None:
+            if fmt == "text":
+                encoded = raw_payload.decode("utf-8", errors="ignore")
+            elif fmt == "hex":
+                encoded = raw_payload.hex()
+            else:
+                fmt = "base64"
+                encoded = base64.b64encode(raw_payload).decode("ascii")
+        bucket.append(
+            {
+                "request_key": key,
+                "name": str(name_prefix or "Builtin probe"),
+                "proto": proto,
+                "scope": scope,
+                "port": port_value,
+                "payload_format": fmt,
+                "payload_encoded": str(encoded or ""),
+                "payload": raw_payload,
+                "description": str(description or ""),
+                "active": 1 if _parse_bool(active, default=True) else 0,
+            }
+        )
+
+    def _iter_builtin_probe_requests(self):
+        rows = _safe_read_json_array(self.banner_requests_file, "requests")
+        output = []
+        seen_keys = set()
+        if rows:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                proto = str(row.get("proto", "")).strip().lower()
+                scope = str(row.get("scope", "")).strip().lower()
+                if proto not in {"tcp", "udp"} or scope not in PROBE_REQUEST_SCOPES:
+                    continue
+                try:
+                    port = int(row.get("port", 0) or 0)
+                except Exception:
+                    port = 0
+                fmt = str(row.get("payload_format", "base64") or "base64").strip().lower()
+                encoded = str(row.get("payload_encoded", "") or "")
+                try:
+                    payload = _decode_probe_payload(encoded, fmt)
+                except Exception:
+                    continue
+                self._append_probe_request(
+                    bucket=output,
+                    seen_keys=seen_keys,
+                    proto=proto,
+                    scope=scope,
+                    port=port,
+                    payload=payload,
+                    payload_format=fmt,
+                    payload_encoded=encoded,
+                    name_prefix=str(row.get("name", "Builtin probe") or "Builtin probe"),
+                    request_key=str(row.get("request_key", "") or ""),
+                    description=str(row.get("description", "") or ""),
+                    active=row.get("active", True),
+                )
+            return output
+
+        for payload in TCP_HTTP_PROBES:
+            self._append_probe_request(
+                bucket=output,
+                seen_keys=seen_keys,
+                proto="tcp",
+                scope="http",
+                port=0,
+                payload=payload,
+                name_prefix="Builtin TCP HTTP probe",
+            )
+        for port, payloads in sorted(TCP_PORT_PROBE_OVERRIDES.items()):
+            for payload in payloads:
+                self._append_probe_request(
+                    bucket=output,
+                    seen_keys=seen_keys,
+                    proto="tcp",
+                    scope="port_override",
+                    port=port,
+                    payload=payload,
+                    name_prefix="Builtin TCP override probe",
+                )
+        for payload in BANNER_TCP_PROBES:
+            self._append_probe_request(
+                bucket=output,
+                seen_keys=seen_keys,
+                proto="tcp",
+                scope="generic",
+                port=0,
+                payload=payload,
+                name_prefix="Builtin TCP generic probe",
+            )
+        for port, payloads in sorted(UDP_PORT_PROBE_OVERRIDES.items()):
+            for payload in payloads:
+                self._append_probe_request(
+                    bucket=output,
+                    seen_keys=seen_keys,
+                    proto="udp",
+                    scope="port_override",
+                    port=port,
+                    payload=payload,
+                    name_prefix="Builtin UDP override probe",
+                )
+        for payload in BANNER_UDP_PROBES:
+            self._append_probe_request(
+                bucket=output,
+                seen_keys=seen_keys,
+                proto="udp",
+                scope="generic",
+                port=0,
+                payload=payload,
+                name_prefix="Builtin UDP generic probe",
+            )
+        return output
+
+    def _iter_builtin_ip_presets(self):
+        rows = _safe_read_json_array(self.ip_presets_file, "ips")
+        output = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                value = _normalize_ip_value(row.get("value", ""))
+            except Exception:
+                continue
+            output.append(
+                {
+                    "value": value,
+                    "label": str(row.get("label", "") or ""),
+                    "description": str(row.get("description", "") or ""),
+                    "active": 1 if _parse_bool(row.get("active", True), default=True) else 0,
+                }
+            )
+        return output
+
+    def _bootstrap_catalog_from_files(self, cursor):
+        if self.catalog_bootstrap_done:
+            return
+        for row in self._iter_builtin_banner_rules():
+            cursor.execute(
+                "INSERT OR IGNORE INTO banner_regex_catalog ("
+                "rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'builtin', 0, ?);",
+                (
+                    row["rule_key"],
+                    row["rule_id"],
+                    row["label"],
+                    row["pattern"],
+                    int(row["flags"]),
+                    row["category"],
+                    row["service"],
+                    row["protocol"],
+                    row["product"],
+                    row["server"],
+                    row["os"],
+                    row["version"],
+                    row["runtime"],
+                    row["framework"],
+                    row["vendor"],
+                    row["powered_by"],
+                    int(row["active"]),
+                ),
+            )
+
+        for row in self._iter_builtin_probe_requests():
+            cursor.execute(
+                "INSERT OR IGNORE INTO banner_probe_catalog ("
+                "request_key, name, proto, scope, port, payload_format, payload_encoded, payload, "
+                "description, source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'builtin', 0, ?);",
+                (
+                    row["request_key"],
+                    row["name"],
+                    row["proto"],
+                    row["scope"],
+                    int(row["port"]),
+                    row["payload_format"],
+                    row["payload_encoded"],
+                    row["payload"],
+                    row["description"],
+                    int(row["active"]),
+                ),
+            )
+
+        for row in self._iter_builtin_ip_presets():
+            cursor.execute(
+                "INSERT OR IGNORE INTO ip_catalog ("
+                "value, label, description, source, mutable, active"
+                ") VALUES (?, ?, ?, 'builtin', 0, ?);",
+                (
+                    row["value"],
+                    row["label"],
+                    row["description"],
+                    int(row["active"]),
+                ),
+            )
+        self.catalog_bootstrap_done = True
+
+    def _refresh_runtime_banner_rules_locked(self, cursor=None):
+        local_cursor = cursor or self.conn.cursor()
+        close_cursor = cursor is None
+        try:
+            local_cursor.execute(
+                "SELECT rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by "
+                "FROM banner_regex_catalog "
+                "WHERE active = 1 "
+                "ORDER BY source DESC, id ASC;"
+            )
+            rows = []
+            for row in local_cursor.fetchall():
+                rows.append(
+                    {
+                        "id": str(row[0] or "").strip(),
+                        "label": str(row[1] or "").strip(),
+                        "pattern": str(row[2] or ""),
+                        "flags": int(row[3] or 0),
+                        "category": str(row[4] or ""),
+                        "service": str(row[5] or ""),
+                        "protocol": str(row[6] or ""),
+                        "product": str(row[7] or ""),
+                        "server": str(row[8] or ""),
+                        "os": str(row[9] or ""),
+                        "version": str(row[10] or ""),
+                        "runtime": str(row[11] or ""),
+                        "framework": str(row[12] or ""),
+                        "vendor": str(row[13] or ""),
+                        "powered_by": str(row[14] or ""),
+                    }
+                )
+            set_runtime_banner_rules(rows)
+        except Exception as exc:
+            print("DB() -> _refresh_runtime_banner_rules_locked():", exc)
+        finally:
+            if close_cursor:
+                local_cursor.close()
+
+    def _apply_runtime_banner_rules(self):
+        self.lock.acquire()
+        try:
+            self._refresh_runtime_banner_rules_locked()
+        finally:
+            self.lock.release()
+
+    def select_banner_regex_rules(self, include_inactive=True):
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            where_sql = "" if include_inactive else "WHERE active = 1"
+            cursor.execute(
+                "SELECT id, rule_key, rule_id, label, pattern, flags, category, service, "
+                "protocol, product, server, os, version, runtime, framework, vendor, "
+                "powered_by, source, mutable, active, created_at, updated_at "
+                f"FROM banner_regex_catalog {where_sql} "
+                "ORDER BY source DESC, id ASC;"
+            )
+            for row in cursor.fetchall():
+                output.append(
+                    {
+                        "id": int(row[0]),
+                        "rule_key": str(row[1] or ""),
+                        "rule_id": str(row[2] or ""),
+                        "label": str(row[3] or ""),
+                        "pattern": str(row[4] or ""),
+                        "flags": int(row[5] or 0),
+                        "category": str(row[6] or ""),
+                        "service": str(row[7] or ""),
+                        "protocol": str(row[8] or ""),
+                        "product": str(row[9] or ""),
+                        "server": str(row[10] or ""),
+                        "os": str(row[11] or ""),
+                        "version": str(row[12] or ""),
+                        "runtime": str(row[13] or ""),
+                        "framework": str(row[14] or ""),
+                        "vendor": str(row[15] or ""),
+                        "powered_by": str(row[16] or ""),
+                        "source": str(row[17] or ""),
+                        "mutable": bool(int(row[18] or 0)),
+                        "active": bool(int(row[19] or 0)),
+                        "created_at": str(row[20] or ""),
+                        "updated_at": str(row[21] or ""),
+                    }
+                )
+        except Exception as e:
+            print("DB() -> select_banner_regex_rules():", e)
+        finally:
+            cursor.close()
+            self.lock.release()
+            return output
+
+    def _normalize_banner_regex_row(self, data, require_id=False):
+        payload = dict(data or {})
+        if require_id:
+            try:
+                payload["id"] = int(payload.get("id"))
+            except Exception:
+                raise ValueError("Invalid regex rule id")
+        rule_id = str(
+            payload.get("rule_id", payload.get("id_name", payload.get("id_alias", "")))
+            or ""
+        ).strip()
+        if not require_id and not rule_id:
+            rule_id = f"custom_rule_{int(time.time() * 1000)}"
+        label = str(payload.get("label", "") or "").strip() or rule_id
+        pattern = str(payload.get("pattern", "") or "")
+        if not pattern:
+            raise ValueError("pattern is required")
+        try:
+            flags = int(payload.get("flags", 0) or 0)
+        except Exception:
+            raise ValueError("Invalid flags value")
+        try:
+            re.compile(pattern, flags)
+        except Exception as exc:
+            raise ValueError(f"Invalid regex pattern: {exc}") from exc
+        output = {
+            "id": payload.get("id"),
+            "rule_key": str(payload.get("rule_key", "") or "").strip(),
+            "rule_id": rule_id,
+            "label": label,
+            "pattern": pattern,
+            "flags": flags,
+            "category": str(payload.get("category", "") or ""),
+            "service": str(payload.get("service", "") or ""),
+            "protocol": str(payload.get("protocol", "") or ""),
+            "product": str(payload.get("product", "") or ""),
+            "server": str(payload.get("server", "") or ""),
+            "os": str(payload.get("os", "") or ""),
+            "version": str(payload.get("version", "") or ""),
+            "runtime": str(payload.get("runtime", "") or ""),
+            "framework": str(payload.get("framework", "") or ""),
+            "vendor": str(payload.get("vendor", "") or ""),
+            "powered_by": str(payload.get("powered_by", "") or ""),
+            "active": 1 if _parse_bool(payload.get("active", True), default=True) else 0,
+        }
+        if not output["rule_key"]:
+            seed = hashlib.sha1(
+                f"{output['rule_id']}|{output['pattern']}".encode("utf-8")
+            ).hexdigest()[:16]
+            output["rule_key"] = f"user_{seed}"
+        return output
+
+    def insert_banner_regex_rule(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_regex_row(data, require_id=False)
+            cursor.execute(
+                "INSERT INTO banner_regex_catalog ("
+                "rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 1, ?);",
+                (
+                    item["rule_key"],
+                    item["rule_id"],
+                    item["label"],
+                    item["pattern"],
+                    int(item["flags"]),
+                    item["category"],
+                    item["service"],
+                    item["protocol"],
+                    item["product"],
+                    item["server"],
+                    item["os"],
+                    item["version"],
+                    item["runtime"],
+                    item["framework"],
+                    item["vendor"],
+                    item["powered_by"],
+                    int(item["active"]),
+                ),
+            )
+            output_id = int(cursor.lastrowid)
+            self.conn.commit()
+            self._refresh_runtime_banner_rules_locked(cursor=cursor)
+            cursor.execute(
+                "SELECT id, rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active, created_at, updated_at "
+                "FROM banner_regex_catalog WHERE id = ? LIMIT 1;",
+                (output_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "rule_key": str(row[1] or ""),
+                    "rule_id": str(row[2] or ""),
+                    "label": str(row[3] or ""),
+                    "pattern": str(row[4] or ""),
+                    "flags": int(row[5] or 0),
+                    "category": str(row[6] or ""),
+                    "service": str(row[7] or ""),
+                    "protocol": str(row[8] or ""),
+                    "product": str(row[9] or ""),
+                    "server": str(row[10] or ""),
+                    "os": str(row[11] or ""),
+                    "version": str(row[12] or ""),
+                    "runtime": str(row[13] or ""),
+                    "framework": str(row[14] or ""),
+                    "vendor": str(row[15] or ""),
+                    "powered_by": str(row[16] or ""),
+                    "source": str(row[17] or ""),
+                    "mutable": bool(int(row[18] or 0)),
+                    "active": bool(int(row[19] or 0)),
+                    "created_at": str(row[20] or ""),
+                    "updated_at": str(row[21] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_banner_regex_rule():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def update_banner_regex_rule(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_regex_row(data, require_id=True)
+            cursor.execute(
+                "SELECT mutable, rule_id FROM banner_regex_catalog WHERE id = ? LIMIT 1;",
+                (int(item["id"]),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Regex rule not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in regex rules cannot be modified")
+            if not item["rule_id"]:
+                item["rule_id"] = str(row[1] or "")
+            cursor.execute(
+                "UPDATE banner_regex_catalog SET "
+                "rule_id = ?, label = ?, pattern = ?, flags = ?, category = ?, service = ?, "
+                "protocol = ?, product = ?, server = ?, os = ?, version = ?, runtime = ?, "
+                "framework = ?, vendor = ?, powered_by = ?, active = ?, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (
+                    item["rule_id"],
+                    item["label"],
+                    item["pattern"],
+                    int(item["flags"]),
+                    item["category"],
+                    item["service"],
+                    item["protocol"],
+                    item["product"],
+                    item["server"],
+                    item["os"],
+                    item["version"],
+                    item["runtime"],
+                    item["framework"],
+                    item["vendor"],
+                    item["powered_by"],
+                    int(item["active"]),
+                    int(item["id"]),
+                ),
+            )
+            self.conn.commit()
+            self._refresh_runtime_banner_rules_locked(cursor=cursor)
+            cursor.execute(
+                "SELECT id, rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active, created_at, updated_at "
+                "FROM banner_regex_catalog WHERE id = ? LIMIT 1;",
+                (int(item["id"]),),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "rule_key": str(row[1] or ""),
+                    "rule_id": str(row[2] or ""),
+                    "label": str(row[3] or ""),
+                    "pattern": str(row[4] or ""),
+                    "flags": int(row[5] or 0),
+                    "category": str(row[6] or ""),
+                    "service": str(row[7] or ""),
+                    "protocol": str(row[8] or ""),
+                    "product": str(row[9] or ""),
+                    "server": str(row[10] or ""),
+                    "os": str(row[11] or ""),
+                    "version": str(row[12] or ""),
+                    "runtime": str(row[13] or ""),
+                    "framework": str(row[14] or ""),
+                    "vendor": str(row[15] or ""),
+                    "powered_by": str(row[16] or ""),
+                    "source": str(row[17] or ""),
+                    "mutable": bool(int(row[18] or 0)),
+                    "active": bool(int(row[19] or 0)),
+                    "created_at": str(row[20] or ""),
+                    "updated_at": str(row[21] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> update_banner_regex_rule():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def delete_banner_regex_rule(self, data):
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            rule_id = int((data or {}).get("id"))
+            cursor.execute(
+                "SELECT mutable FROM banner_regex_catalog WHERE id = ? LIMIT 1;",
+                (rule_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Regex rule not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in regex rules cannot be deleted")
+            cursor.execute("DELETE FROM banner_regex_catalog WHERE id = ?;", (rule_id,))
+            self.conn.commit()
+            self._refresh_runtime_banner_rules_locked(cursor=cursor)
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_banner_regex_rule():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+
+    def select_banner_probe_requests(self, proto="", include_inactive=True):
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            proto_value = str(proto or "").strip().lower()
+            params = []
+            where = []
+            if proto_value:
+                where.append("proto = ?")
+                params.append(proto_value)
+            if not include_inactive:
+                where.append("active = 1")
+            where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+            cursor.execute(
+                "SELECT id, request_key, name, proto, scope, port, payload_format, payload_encoded, "
+                "payload, description, source, mutable, active, created_at, updated_at "
+                f"FROM banner_probe_catalog {where_sql} "
+                "ORDER BY source DESC, id ASC;",
+                tuple(params),
+            )
+            for row in cursor.fetchall():
+                payload_blob = bytes(row[8] or b"")
+                output.append(
+                    {
+                        "id": int(row[0]),
+                        "request_key": str(row[1] or ""),
+                        "name": str(row[2] or ""),
+                        "proto": str(row[3] or ""),
+                        "scope": str(row[4] or ""),
+                        "port": int(row[5] or 0),
+                        "payload_format": str(row[6] or "text"),
+                        "payload_encoded": str(row[7] or ""),
+                        "payload_len": len(payload_blob),
+                        "payload_preview": _payload_preview(payload_blob),
+                        "description": str(row[9] or ""),
+                        "source": str(row[10] or ""),
+                        "mutable": bool(int(row[11] or 0)),
+                        "active": bool(int(row[12] or 0)),
+                        "created_at": str(row[13] or ""),
+                        "updated_at": str(row[14] or ""),
+                    }
+                )
+        except Exception as e:
+            print("DB() -> select_banner_probe_requests():", e)
+        finally:
+            cursor.close()
+            self.lock.release()
+            return output
+
+    def _normalize_banner_probe_row(self, data, require_id=False):
+        payload = dict(data or {})
+        if require_id:
+            try:
+                payload["id"] = int(payload.get("id"))
+            except Exception:
+                raise ValueError("Invalid banner request id")
+        proto = str(payload.get("proto", "") or "").strip().lower()
+        if proto not in {"tcp", "udp"}:
+            raise ValueError("Invalid proto. Use tcp or udp")
+        scope = str(payload.get("scope", "generic") or "generic").strip().lower()
+        if scope not in PROBE_REQUEST_SCOPES:
+            raise ValueError("Invalid scope. Use generic, http or port_override")
+        if proto == "udp" and scope == "http":
+            raise ValueError("scope=http is only supported for proto=tcp")
+        try:
+            port = int(payload.get("port", 0) or 0)
+        except Exception:
+            raise ValueError("Invalid port value")
+        if scope == "port_override":
+            if port < 1 or port > 65535:
+                raise ValueError("port must be between 1 and 65535 for port_override")
+        else:
+            port = 0
+        fmt = str(payload.get("payload_format", "text") or "text").strip().lower()
+        encoded = str(payload.get("payload_encoded", "") or "")
+        if not encoded and payload.get("payload") is not None:
+            encoded = str(payload.get("payload"))
+        if not encoded:
+            raise ValueError("payload_encoded is required")
+        raw_payload = _decode_probe_payload(encoded, fmt)
+        if not raw_payload:
+            raise ValueError("payload must not be empty")
+        name = str(payload.get("name", "") or "").strip() or "Custom probe request"
+        description = str(payload.get("description", "") or "")
+        request_key = str(payload.get("request_key", "") or "").strip()
+        if not request_key:
+            digest = hashlib.sha256(
+                f"{proto}|{scope}|{port}|".encode("utf-8") + raw_payload
+            ).hexdigest()[:16]
+            request_key = f"user_{proto}_{scope}_{port}_{digest}"
+        return {
+            "id": payload.get("id"),
+            "request_key": request_key,
+            "name": name,
+            "proto": proto,
+            "scope": scope,
+            "port": port,
+            "payload_format": fmt,
+            "payload_encoded": encoded,
+            "payload": raw_payload,
+            "description": description,
+            "active": 1 if _parse_bool(payload.get("active", True), default=True) else 0,
+        }
+
+    def insert_banner_probe_request(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_probe_row(data, require_id=False)
+            cursor.execute(
+                "INSERT INTO banner_probe_catalog ("
+                "request_key, name, proto, scope, port, payload_format, payload_encoded, "
+                "payload, description, source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 1, ?);",
+                (
+                    item["request_key"],
+                    item["name"],
+                    item["proto"],
+                    item["scope"],
+                    int(item["port"]),
+                    item["payload_format"],
+                    item["payload_encoded"],
+                    item["payload"],
+                    item["description"],
+                    int(item["active"]),
+                ),
+            )
+            output_id = int(cursor.lastrowid)
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, request_key, name, proto, scope, port, payload_format, payload_encoded, payload, "
+                "description, source, mutable, active, created_at, updated_at "
+                "FROM banner_probe_catalog WHERE id = ? LIMIT 1;",
+                (output_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                payload_blob = bytes(row[8] or b"")
+                output = {
+                    "id": int(row[0]),
+                    "request_key": str(row[1] or ""),
+                    "name": str(row[2] or ""),
+                    "proto": str(row[3] or ""),
+                    "scope": str(row[4] or ""),
+                    "port": int(row[5] or 0),
+                    "payload_format": str(row[6] or "text"),
+                    "payload_encoded": str(row[7] or ""),
+                    "payload_len": len(payload_blob),
+                    "payload_preview": _payload_preview(payload_blob),
+                    "description": str(row[9] or ""),
+                    "source": str(row[10] or ""),
+                    "mutable": bool(int(row[11] or 0)),
+                    "active": bool(int(row[12] or 0)),
+                    "created_at": str(row[13] or ""),
+                    "updated_at": str(row[14] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_banner_probe_request():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def update_banner_probe_request(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_probe_row(data, require_id=True)
+            cursor.execute(
+                "SELECT mutable FROM banner_probe_catalog WHERE id = ? LIMIT 1;",
+                (int(item["id"]),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Banner request not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in banner requests cannot be modified")
+            cursor.execute(
+                "UPDATE banner_probe_catalog SET "
+                "name = ?, proto = ?, scope = ?, port = ?, payload_format = ?, "
+                "payload_encoded = ?, payload = ?, description = ?, active = ?, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (
+                    item["name"],
+                    item["proto"],
+                    item["scope"],
+                    int(item["port"]),
+                    item["payload_format"],
+                    item["payload_encoded"],
+                    item["payload"],
+                    item["description"],
+                    int(item["active"]),
+                    int(item["id"]),
+                ),
+            )
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, request_key, name, proto, scope, port, payload_format, payload_encoded, payload, "
+                "description, source, mutable, active, created_at, updated_at "
+                "FROM banner_probe_catalog WHERE id = ? LIMIT 1;",
+                (int(item["id"]),),
+            )
+            row = cursor.fetchone()
+            if row:
+                payload_blob = bytes(row[8] or b"")
+                output = {
+                    "id": int(row[0]),
+                    "request_key": str(row[1] or ""),
+                    "name": str(row[2] or ""),
+                    "proto": str(row[3] or ""),
+                    "scope": str(row[4] or ""),
+                    "port": int(row[5] or 0),
+                    "payload_format": str(row[6] or "text"),
+                    "payload_encoded": str(row[7] or ""),
+                    "payload_len": len(payload_blob),
+                    "payload_preview": _payload_preview(payload_blob),
+                    "description": str(row[9] or ""),
+                    "source": str(row[10] or ""),
+                    "mutable": bool(int(row[11] or 0)),
+                    "active": bool(int(row[12] or 0)),
+                    "created_at": str(row[13] or ""),
+                    "updated_at": str(row[14] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> update_banner_probe_request():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def delete_banner_probe_request(self, data):
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            request_id = int((data or {}).get("id"))
+            cursor.execute(
+                "SELECT mutable FROM banner_probe_catalog WHERE id = ? LIMIT 1;",
+                (request_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Banner request not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in banner requests cannot be deleted")
+            cursor.execute("DELETE FROM banner_probe_catalog WHERE id = ?;", (request_id,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_banner_probe_request():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+
+    def load_probe_payloads(self, proto):
+        output = {"generic": [], "http": [], "overrides": {}}
+        proto_value = str(proto or "").strip().lower()
+        if proto_value not in {"tcp", "udp"}:
+            return output
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT scope, port, payload FROM banner_probe_catalog "
+                "WHERE proto = ? AND active = 1 "
+                "ORDER BY source DESC, id ASC;",
+                (proto_value,),
+            )
+            for scope, port, payload in cursor.fetchall():
+                scope_value = str(scope or "").strip().lower()
+                if scope_value not in PROBE_REQUEST_SCOPES:
+                    continue
+                raw_payload = bytes(payload or b"")
+                if not raw_payload:
+                    continue
+                if scope_value == "port_override":
+                    try:
+                        port_value = int(port or 0)
+                    except Exception:
+                        continue
+                    if port_value < 1 or port_value > 65535:
+                        continue
+                    output["overrides"].setdefault(port_value, []).append(raw_payload)
+                elif scope_value == "http":
+                    if proto_value != "tcp":
+                        continue
+                    output["http"].append(raw_payload)
+                else:
+                    output["generic"].append(raw_payload)
+        except Exception as e:
+            print("DB() -> load_probe_payloads():", e)
+        finally:
+            cursor.close()
+            self.lock.release()
+            return output
+
+    def select_ip_presets(self, include_inactive=True):
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            where_sql = "" if include_inactive else "WHERE active = 1"
+            cursor.execute(
+                "SELECT id, value, label, description, source, mutable, active, created_at, updated_at "
+                f"FROM ip_catalog {where_sql} "
+                "ORDER BY source DESC, id ASC;"
+            )
+            for row in cursor.fetchall():
+                output.append(
+                    {
+                        "id": int(row[0]),
+                        "value": str(row[1] or ""),
+                        "label": str(row[2] or ""),
+                        "description": str(row[3] or ""),
+                        "source": str(row[4] or ""),
+                        "mutable": bool(int(row[5] or 0)),
+                        "active": bool(int(row[6] or 0)),
+                        "created_at": str(row[7] or ""),
+                        "updated_at": str(row[8] or ""),
+                    }
+                )
+        except Exception as e:
+            print("DB() -> select_ip_presets():", e)
+        finally:
+            cursor.close()
+            self.lock.release()
+            return output
+
+    def insert_ip_preset(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            value = _normalize_ip_value((data or {}).get("value", ""))
+            label = str((data or {}).get("label", "") or "").strip()
+            description = str((data or {}).get("description", "") or "")
+            active = 1 if _parse_bool((data or {}).get("active", True), default=True) else 0
+            cursor.execute(
+                "INSERT INTO ip_catalog (value, label, description, source, mutable, active) "
+                "VALUES (?, ?, ?, 'user', 1, ?);",
+                (value, label, description, active),
+            )
+            output_id = int(cursor.lastrowid)
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, value, label, description, source, mutable, active, created_at, updated_at "
+                "FROM ip_catalog WHERE id = ? LIMIT 1;",
+                (output_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "value": str(row[1] or ""),
+                    "label": str(row[2] or ""),
+                    "description": str(row[3] or ""),
+                    "source": str(row[4] or ""),
+                    "mutable": bool(int(row[5] or 0)),
+                    "active": bool(int(row[6] or 0)),
+                    "created_at": str(row[7] or ""),
+                    "updated_at": str(row[8] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_ip_preset():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def update_ip_preset(self, data):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item_id = int((data or {}).get("id"))
+            cursor.execute(
+                "SELECT mutable FROM ip_catalog WHERE id = ? LIMIT 1;",
+                (item_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("IP preset not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in IP presets cannot be modified")
+            value = _normalize_ip_value((data or {}).get("value", ""))
+            label = str((data or {}).get("label", "") or "").strip()
+            description = str((data or {}).get("description", "") or "")
+            active = 1 if _parse_bool((data or {}).get("active", True), default=True) else 0
+            cursor.execute(
+                "UPDATE ip_catalog SET value = ?, label = ?, description = ?, active = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+                (value, label, description, active, item_id),
+            )
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, value, label, description, source, mutable, active, created_at, updated_at "
+                "FROM ip_catalog WHERE id = ? LIMIT 1;",
+                (item_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "value": str(row[1] or ""),
+                    "label": str(row[2] or ""),
+                    "description": str(row[3] or ""),
+                    "source": str(row[4] or ""),
+                    "mutable": bool(int(row[5] or 0)),
+                    "active": bool(int(row[6] or 0)),
+                    "created_at": str(row[7] or ""),
+                    "updated_at": str(row[8] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> update_ip_preset():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def delete_ip_preset(self, data):
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item_id = int((data or {}).get("id"))
+            cursor.execute(
+                "SELECT mutable FROM ip_catalog WHERE id = ? LIMIT 1;",
+                (item_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("IP preset not found")
+            if int(row[0] or 0) == 0:
+                raise PermissionError("Built-in IP presets cannot be deleted")
+            cursor.execute("DELETE FROM ip_catalog WHERE id = ?;", (item_id,))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_ip_preset():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+
+    def _serialize_cluster_agent_credential_row(self, row):
+        if not row:
+            return {}
+        return {
+            "id": int(row[0]),
+            "agent_id": str(row[1] or ""),
+            "active": bool(int(row[2] or 0)),
+            "created_at": str(row[3] or ""),
+            "updated_at": str(row[4] or ""),
+            "last_used_at": str(row[5] or ""),
+        }
+
+    def select_cluster_agent_credentials(self, include_inactive=True):
+        output = []
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            where_sql = "" if include_inactive else "WHERE active = 1"
+            cursor.execute(
+                "SELECT id, agent_id, active, created_at, updated_at, last_used_at "
+                f"FROM cluster_agent_credentials {where_sql} "
+                "ORDER BY id ASC;"
+            )
+            output = [
+                self._serialize_cluster_agent_credential_row(row)
+                for row in cursor.fetchall()
+            ]
+        except Exception as e:
+            print("DB() -> select_cluster_agent_credentials():", e)
+        finally:
+            cursor.close()
+            self.lock.release()
+            return output
+
+    def create_cluster_agent_credential(self, data):
+        output = {}
+        payload = dict(data or {})
+        agent_id = _normalize_agent_id(payload.get("agent_id", ""), generate_if_missing=True)
+        provided_key = str(payload.get("agent_key", "") or "").strip()
+        if provided_key:
+            agent_key = provided_key
+        else:
+            # URL-safe token is easy to copy in terminal and web onboarding.
+            agent_key = secrets.token_urlsafe(24)
+        key_hash = _hash_agent_shared_key(agent_key)
+
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id FROM cluster_agent_credentials WHERE agent_id = ? LIMIT 1;",
+                (agent_id,),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                row_id = int(existing[0])
+                cursor.execute(
+                    "UPDATE cluster_agent_credentials SET "
+                    "key_hash = ?, active = 1, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?;",
+                    (key_hash, row_id),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO cluster_agent_credentials (agent_id, key_hash, active) "
+                    "VALUES (?, ?, 1);",
+                    (agent_id, key_hash),
+                )
+                row_id = int(cursor.lastrowid)
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, agent_id, active, created_at, updated_at, last_used_at "
+                "FROM cluster_agent_credentials WHERE id = ? LIMIT 1;",
+                (row_id,),
+            )
+            output = self._serialize_cluster_agent_credential_row(cursor.fetchone())
+            output["agent_key"] = agent_key
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> create_cluster_agent_credential():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def revoke_cluster_agent_credential(self, data):
+        output = {}
+        payload = dict(data or {})
+        row_id = payload.get("id")
+        agent_id_raw = str(payload.get("agent_id", "") or "").strip()
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            query = ""
+            params = ()
+            if row_id is not None:
+                try:
+                    row_id = int(row_id)
+                except Exception:
+                    raise ValueError("Invalid credential id")
+                query = (
+                    "SELECT id FROM cluster_agent_credentials "
+                    "WHERE id = ? LIMIT 1;"
+                )
+                params = (row_id,)
+            elif agent_id_raw:
+                agent_id = _normalize_agent_id(agent_id_raw, generate_if_missing=False)
+                query = (
+                    "SELECT id FROM cluster_agent_credentials "
+                    "WHERE agent_id = ? LIMIT 1;"
+                )
+                params = (agent_id,)
+            else:
+                raise ValueError("id or agent_id is required")
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Agent credential not found")
+            resolved_id = int(row[0])
+            cursor.execute(
+                "UPDATE cluster_agent_credentials SET "
+                "active = 0, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?;",
+                (resolved_id,),
+            )
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, agent_id, active, created_at, updated_at, last_used_at "
+                "FROM cluster_agent_credentials WHERE id = ? LIMIT 1;",
+                (resolved_id,),
+            )
+            output = self._serialize_cluster_agent_credential_row(cursor.fetchone())
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> revoke_cluster_agent_credential():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def verify_cluster_agent_shared_key(self, agent_id, agent_key, touch_last_used=True):
+        valid = False
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            normalized_agent_id = _normalize_agent_id(
+                agent_id,
+                generate_if_missing=False,
+            )
+            expected_hash = _hash_agent_shared_key(agent_key)
+            cursor.execute(
+                "SELECT key_hash, active FROM cluster_agent_credentials "
+                "WHERE agent_id = ? LIMIT 1;",
+                (normalized_agent_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            if int(row[1] or 0) != 1:
+                return False
+            valid = hmac.compare_digest(str(row[0] or ""), expected_hash)
+            if valid and touch_last_used:
+                cursor.execute(
+                    "UPDATE cluster_agent_credentials SET "
+                    "last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE agent_id = ?;",
+                    (normalized_agent_id,),
+                )
+                self.conn.commit()
+        except Exception as e:
+            print("DB() -> verify_cluster_agent_shared_key():", e)
+            valid = False
+        finally:
+            cursor.close()
+            self.lock.release()
+            return bool(valid)
 
     def geoip_status(self):
         output = {}
@@ -2191,6 +3636,104 @@ class API(threading.Thread):
                     )
                 else:
                     response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/api/catalog/banner-rules/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps(
+                            {"datas": self.db.select_banner_regex_rules(include_inactive=True)}
+                        ),
+                    )
+                elif method == "POST":
+                    item = self.db.insert_banner_regex_rule(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "PUT":
+                    item = self.db.update_banner_regex_rule(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "DELETE":
+                    self.db.delete_banner_regex_rule(json.loads(body or "{}"))
+                    response = self.build_response(200, json.dumps({"status": "ok"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/api/catalog/banner-requests/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps(
+                            {
+                                "datas": self.db.select_banner_probe_requests(
+                                    include_inactive=True
+                                )
+                            }
+                        ),
+                    )
+                elif method == "POST":
+                    item = self.db.insert_banner_probe_request(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "PUT":
+                    item = self.db.update_banner_probe_request(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "DELETE":
+                    self.db.delete_banner_probe_request(json.loads(body or "{}"))
+                    response = self.build_response(200, json.dumps({"status": "ok"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
+            elif path == "/api/catalog/ip-presets/":
+                if method == "GET":
+                    response = self.build_response(
+                        200,
+                        json.dumps({"datas": self.db.select_ip_presets(include_inactive=True)}),
+                    )
+                elif method == "POST":
+                    item = self.db.insert_ip_preset(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "PUT":
+                    item = self.db.update_ip_preset(json.loads(body or "{}"))
+                    response = self.build_response(
+                        200, json.dumps({"status": "ok", "data": item})
+                    )
+                elif method == "DELETE":
+                    self.db.delete_ip_preset(json.loads(body or "{}"))
+                    response = self.build_response(200, json.dumps({"status": "ok"}))
+                elif method == "OPTIONS":
+                    response = self.build_response(
+                        200,
+                        "",
+                        headers={
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                        },
+                    )
+                else:
+                    response = self.build_response(405, json.dumps({"status": "405"}))
             elif path == "/banners/":
                 if method == "GET":
                     response = self.build_response(
@@ -3414,14 +4957,29 @@ class BannerUDP(threading.Thread):
         threading.Thread.__init__(self)
         self.db = db
         self.stop_event = threading.Event()
+        payload_sets = {}
+        if self.db is not None and hasattr(self.db, "load_probe_payloads"):
+            try:
+                payload_sets = self.db.load_probe_payloads("udp") or {}
+            except Exception:
+                payload_sets = {}
+        self.port_probe_overrides = payload_sets.get("overrides") or {
+            int(port): [bytes(p) for p in payloads]
+            for port, payloads in UDP_PORT_PROBE_OVERRIDES.items()
+        }
+        self.generic_requests = dedupe_probe_payloads(
+            payload_sets.get("generic") or self.BANNERS
+        )
         coverage_probes = []
-        for probe_group in UDP_PORT_PROBE_OVERRIDES.values():
+        for probe_group in self.port_probe_overrides.values():
             coverage_probes.extend(probe_group)
-        self.banner_requests = dedupe_probe_payloads(coverage_probes + self.BANNERS)
+        self.banner_requests = dedupe_probe_payloads(
+            coverage_probes + self.generic_requests
+        )
 
     def _build_probe_sequence(self, port: int):
         probes = []
-        probes.extend(UDP_PORT_PROBE_OVERRIDES.get(port, []))
+        probes.extend(self.port_probe_overrides.get(port, []))
         probes.extend(self.banner_requests)
         probes = dedupe_probe_payloads(probes)
         if self.MAX_PROBES_PER_PORT > 0:
@@ -3597,18 +5155,34 @@ class BannerTCP(threading.Thread):
         threading.Thread.__init__(self)
         self.db = db
         self.stop_event = threading.Event()
+        payload_sets = {}
+        if self.db is not None and hasattr(self.db, "load_probe_payloads"):
+            try:
+                payload_sets = self.db.load_probe_payloads("tcp") or {}
+            except Exception:
+                payload_sets = {}
+        self.port_probe_overrides = payload_sets.get("overrides") or {
+            int(port): [bytes(p) for p in payloads]
+            for port, payloads in TCP_PORT_PROBE_OVERRIDES.items()
+        }
+        self.http_requests = dedupe_probe_payloads(
+            payload_sets.get("http") or TCP_HTTP_PROBES
+        )
+        self.generic_requests = dedupe_probe_payloads(
+            payload_sets.get("generic") or self.BANNERS
+        )
         coverage_probes = []
-        for probe_group in TCP_PORT_PROBE_OVERRIDES.values():
+        for probe_group in self.port_probe_overrides.values():
             coverage_probes.extend(probe_group)
         self.banner_requests = dedupe_probe_payloads(
-            TCP_HTTP_PROBES + coverage_probes + self.BANNERS
+            self.http_requests + coverage_probes + self.generic_requests
         )
 
     def _build_probe_sequence(self, port: int):
         probes = []
-        probes.extend(TCP_PORT_PROBE_OVERRIDES.get(port, []))
+        probes.extend(self.port_probe_overrides.get(port, []))
         if port in TCP_HTTP_PORTS:
-            probes.extend(TCP_HTTP_PROBES)
+            probes.extend(self.http_requests)
         probes.extend(self.banner_requests)
         probes = dedupe_probe_payloads(probes)
         if self.MAX_PROBES_PER_PORT > 0:
