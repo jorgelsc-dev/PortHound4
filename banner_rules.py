@@ -754,10 +754,53 @@ BANNER_REGEX_RULES = [
 ]
 
 
-COMPILED_BANNER_REGEX_RULES = [
-    {**rule, "regex": re.compile(rule["pattern"], rule.get("flags", 0))}
-    for rule in BANNER_REGEX_RULES
-]
+def _compile_banner_rules(rules):
+    compiled = []
+    for raw_rule in rules or []:
+        if not isinstance(raw_rule, dict):
+            continue
+        rule = dict(raw_rule)
+        pattern = str(rule.get("pattern", "") or "")
+        if not pattern:
+            continue
+        try:
+            flags = int(rule.get("flags", 0) or 0)
+        except Exception:
+            flags = 0
+        rule["flags"] = flags
+        rule_id = str(rule.get("id", "") or "").strip()
+        if not rule_id:
+            rule_id = f"rule_{len(compiled) + 1:04d}"
+        rule["id"] = rule_id
+        label = str(rule.get("label", "") or "").strip() or rule_id
+        rule["label"] = label
+        try:
+            rule["regex"] = re.compile(pattern, flags)
+        except Exception:
+            continue
+        compiled.append(rule)
+    return compiled
+
+
+COMPILED_BANNER_REGEX_RULES = _compile_banner_rules(BANNER_REGEX_RULES)
+
+
+def set_runtime_banner_rules(rules):
+    global COMPILED_BANNER_REGEX_RULES
+    compiled = _compile_banner_rules(rules)
+    if not compiled:
+        compiled = _compile_banner_rules(BANNER_REGEX_RULES)
+    COMPILED_BANNER_REGEX_RULES = compiled
+    return len(COMPILED_BANNER_REGEX_RULES)
+
+
+def get_runtime_banner_rule_ids():
+    output = []
+    for rule in COMPILED_BANNER_REGEX_RULES:
+        rule_id = str((rule or {}).get("id", "") or "").strip()
+        if rule_id:
+            output.append(rule_id)
+    return output
 
 
 _PROTOCOL_ALIASES = {
@@ -1279,4 +1322,6 @@ __all__ = [
     "apply_banner_rules",
     "review_banner_payload",
     "build_banner_rule_tags",
+    "set_runtime_banner_rules",
+    "get_runtime_banner_rule_ids",
 ]

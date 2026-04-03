@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "porthound4"
+version = "0.1.0"
+description = "PortHound4 network scanner with master/agent orchestration."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "PortHound4 Authors" }]
+keywords = ["network", "scanner", "security", "tcp", "udp", "banner"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+porthound = "manage:main"
+
+[tool.setuptools]
+py-modules = [
+  "agent",
+  "app",
+  "banner_rules",
+  "country_centroids",
+  "framework",
+  "geoip_seed",
+  "getDBNIC",
+  "manage",
+  "master",
+  "scan_payloads",
+  "server",
+  "settings",
+  "ws_demo",
+]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"porthound/data" = ["data/**"]
+"porthound/docs" = ["docs/**"]
+"porthound/frontend" = ["frontend/dist/**"]
