@@ -103,3 +103,10 @@ Desktop.ini
 /frontend/.turbo/
 /frontend/dist/
 /frontend/.env*
+
+# MCP local server
+/mcp_chromium/
+MCP.md
+
+# MCP QA artifacts
+/mcp/artifacts/

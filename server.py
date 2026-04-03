@@ -386,7 +386,7 @@ def _normalize_agent_id(value, generate_if_missing=True):
 def _hash_agent_shared_key(value):
     raw = str(value or "").strip()
     if len(raw) < 16:
-        raise ValueError("agent_key must be at least 16 characters")
+        raise ValueError("token must be at least 16 characters")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -1758,9 +1758,14 @@ class DB(object):
         output = {}
         payload = dict(data or {})
         agent_id = _normalize_agent_id(payload.get("agent_id", ""), generate_if_missing=True)
-        provided_key = str(payload.get("agent_key", "") or "").strip()
-        if provided_key:
-            agent_key = provided_key
+        provided_token = ""
+        for key in ("token", "agent_token", "agent_key", "shared_key", "key"):
+            candidate = str(payload.get(key, "") or "").strip()
+            if candidate:
+                provided_token = candidate
+                break
+        if provided_token:
+            agent_key = provided_token
         else:
             # URL-safe token is easy to copy in terminal and web onboarding.
             agent_key = secrets.token_urlsafe(24)
@@ -1797,6 +1802,7 @@ class DB(object):
             )
             output = self._serialize_cluster_agent_credential_row(cursor.fetchone())
             output["agent_key"] = agent_key
+            output["token"] = agent_key
         except Exception as e:
             self.conn.rollback()
             print("DB() -> create_cluster_agent_credential():", e)
@@ -1862,6 +1868,55 @@ class DB(object):
             self.lock.release()
         return output
 
+    def delete_cluster_agent_credential(self, data):
+        output = {}
+        payload = dict(data or {})
+        row_id = payload.get("id")
+        agent_id_raw = str(payload.get("agent_id", "") or "").strip()
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            query = ""
+            params = ()
+            if row_id is not None:
+                try:
+                    row_id = int(row_id)
+                except Exception:
+                    raise ValueError("Invalid credential id")
+                query = (
+                    "SELECT id, agent_id, active, created_at, updated_at, last_used_at "
+                    "FROM cluster_agent_credentials WHERE id = ? LIMIT 1;"
+                )
+                params = (row_id,)
+            elif agent_id_raw:
+                agent_id = _normalize_agent_id(agent_id_raw, generate_if_missing=False)
+                query = (
+                    "SELECT id, agent_id, active, created_at, updated_at, last_used_at "
+                    "FROM cluster_agent_credentials WHERE agent_id = ? LIMIT 1;"
+                )
+                params = (agent_id,)
+            else:
+                raise ValueError("id or agent_id is required")
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError("Agent credential not found")
+            output = self._serialize_cluster_agent_credential_row(row)
+            resolved_id = int(row[0])
+            cursor.execute(
+                "DELETE FROM cluster_agent_credentials WHERE id = ?;",
+                (resolved_id,),
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> delete_cluster_agent_credential():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
     def verify_cluster_agent_shared_key(self, agent_id, agent_key, touch_last_used=True):
         valid = False
         self.lock.acquire()
@@ -1871,7 +1926,8 @@ class DB(object):
                 agent_id,
                 generate_if_missing=False,
             )
-            expected_hash = _hash_agent_shared_key(agent_key)
+            provided_token = str(agent_key or "").strip()
+            expected_hash = _hash_agent_shared_key(provided_token)
             cursor.execute(
                 "SELECT key_hash, active FROM cluster_agent_credentials "
                 "WHERE agent_id = ? LIMIT 1;",
