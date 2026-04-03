@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ipaddress
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -185,7 +186,7 @@ def write_env_files(out_dir: Path, master_host: str):
                 "export PORTHOUND_HOST=0.0.0.0",
                 "export PORTHOUND_PORT=45678",
                 "export PORTHOUND_TLS_ENABLED=1",
-                "export PORTHOUND_TLS_REQUIRE_CLIENT_CERT=1",
+                "export PORTHOUND_TLS_REQUIRE_CLIENT_CERT=0",
                 f"export PORTHOUND_CA={ca_cert}",
                 f"export PORTHOUND_CA_ONELINE='{ca_oneline}'",
                 f"export PORTHOUND_TLS_CERT_FILE={master_cert}",
@@ -202,8 +203,11 @@ def write_env_files(out_dir: Path, master_host: str):
                 f"export PORTHOUND_MASTER=https://{master_host}:45678",
                 f"export PORTHOUND_CA={ca_cert}",
                 f"export PORTHOUND_CA_ONELINE='{ca_oneline}'",
-                f"export PORTHOUND_AGENT_CERT={agent_cert}",
-                f"export PORTHOUND_AGENT_KEY={agent_key}",
+                "export PORTHOUND_AGENT_ID=",
+                "export PORTHOUND_AGENT_SHARED_KEY=",
+                "# Optional mTLS client certificate mode:",
+                f"# export PORTHOUND_AGENT_CERT={agent_cert}",
+                f"# export PORTHOUND_AGENT_KEY={agent_key}",
                 "export PORTHOUND_IP=",
                 "",
             ]
@@ -221,6 +225,128 @@ def write_env_files(out_dir: Path, master_host: str):
         ),
         encoding="utf-8",
     )
+
+
+def _is_interactive_terminal():
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _has_non_interactive_cli_overrides(argv=None):
+    tokens = list(argv if argv is not None else sys.argv[1:])
+    if not tokens:
+        return False
+    for token in tokens:
+        text = str(token or "").strip()
+        if not text:
+            continue
+        if text == "--interactive":
+            continue
+        return True
+    return False
+
+
+def _prompt_text(label, default="", required=False):
+    default_text = str(default or "").strip()
+    suffix = f" [{default_text}]" if default_text else ""
+    while True:
+        try:
+            value = input(f"{label}{suffix}: ")
+        except EOFError:
+            value = ""
+        value = str(value or "").strip()
+        if value:
+            return value
+        if default_text:
+            return default_text
+        if not required:
+            return ""
+        print(f"[certs] {label} is required.")
+
+
+def _prompt_bool(label, default=False):
+    default_hint = "yes" if bool(default) else "no"
+    while True:
+        raw = _prompt_text(label, default=default_hint, required=True).strip().lower()
+        if raw in {"1", "true", "yes", "on", "y"}:
+            return True
+        if raw in {"0", "false", "no", "off", "n"}:
+            return False
+        print("[certs] Use yes/no (or 1/0).")
+
+
+def _prompt_int(label, default, min_value=None):
+    default_text = str(default)
+    while True:
+        raw = _prompt_text(label, default=default_text, required=True)
+        try:
+            number = int(raw)
+        except Exception:
+            print(f"[certs] {label} must be an integer.")
+            continue
+        if min_value is not None and number < int(min_value):
+            print(f"[certs] {label} must be >= {min_value}.")
+            continue
+        return number
+
+
+def _split_csv_values(value: str):
+    output = []
+    for part in str(value or "").split(","):
+        item = str(part or "").strip()
+        if item:
+            output.append(item)
+    return output
+
+
+def _validate_ip_list(values):
+    output = []
+    for raw in list(values or []):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        ipaddress.ip_address(text)
+        output.append(text)
+    return output
+
+
+def run_interactive_onboarding(args):
+    args.out_dir = _prompt_text("Output directory", args.out_dir, required=True)
+    hosts_default = ",".join([str(v or "").strip() for v in args.master_host if str(v or "").strip()]) or "localhost"
+    while True:
+        hosts_raw = _prompt_text(
+            "Master DNS SANs (comma-separated)",
+            hosts_default,
+            required=True,
+        )
+        hosts = _split_csv_values(hosts_raw)
+        if hosts:
+            args.master_host = hosts
+            break
+        print("[certs] At least one master host is required.")
+
+    ips_default = ",".join([str(v or "").strip() for v in args.master_ip if str(v or "").strip()]) or "127.0.0.1"
+    while True:
+        ips_raw = _prompt_text(
+            "Master IP SANs (comma-separated)",
+            ips_default,
+            required=True,
+        )
+        try:
+            ips = _validate_ip_list(_split_csv_values(ips_raw))
+        except Exception:
+            print("[certs] Invalid IP list.")
+            continue
+        if ips:
+            args.master_ip = ips
+            break
+        print("[certs] At least one master IP is required.")
+
+    args.ca_cn = _prompt_text("CA Common Name", args.ca_cn, required=True)
+    args.master_cn = _prompt_text("Master Common Name", args.master_cn, required=True)
+    args.admin_cn = _prompt_text("Admin Common Name", args.admin_cn, required=True)
+    args.agent_cn = _prompt_text("Agent Common Name", args.agent_cn, required=True)
+    args.days = _prompt_int("Leaf cert validity (days)", args.days, min_value=1)
+    args.overwrite = _prompt_bool("Overwrite existing cert files", default=bool(args.overwrite))
 
 
 def parse_args():
@@ -246,11 +372,19 @@ def parse_args():
     parser.add_argument("--agent-cn", default="porthound-agent")
     parser.add_argument("--days", type=int, default=825, help="Leaf cert validity in days")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt values one by one in terminal.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    has_non_interactive_cli_overrides = _has_non_interactive_cli_overrides()
+    if _is_interactive_terminal() and (args.interactive or not has_non_interactive_cli_overrides):
+        run_interactive_onboarding(args)
     out_dir = Path(args.out_dir).resolve()
     sans = parse_sans(args.master_host, args.master_ip)
 

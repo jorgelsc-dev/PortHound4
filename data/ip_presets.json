@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "ips": [
+    {
+      "value": "127.0.0.1",
+      "label": "Localhost",
+      "description": "Loopback host for local scanner tests."
+    },
+    {
+      "value": "10.0.0.0/24",
+      "label": "Private Net A",
+      "description": "Private CIDR preset for lab scanning."
+    },
+    {
+      "value": "10.0.1.0/24",
+      "label": "Private Net B",
+      "description": "Secondary private CIDR preset."
+    },
+    {
+      "value": "10.0.2.0/24",
+      "label": "Private Net C",
+      "description": "Extra private CIDR preset."
+    },
+    {
+      "value": "172.16.0.0/24",
+      "label": "RFC1918 172.16/24",
+      "description": "Private 172.16.0.0 range."
+    },
+    {
+      "value": "192.168.1.0/24",
+      "label": "Home LAN preset",
+      "description": "Typical local network preset."
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import json
 import mimetypes
 import random
+import sqlite3
 import re
 import errno
 import base64
@@ -11,11 +12,10 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
+from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, ip_address, ip_network
 from pathlib import Path
-from urllib.parse import urlsplit
-
 import settings
 from framework import App, Response, Route, parse_close_payload
 
@@ -40,7 +40,18 @@ from ws_demo import INDEX_HTML, Database, ChatMessage, parse_chat_line, ClientRe
 REGEX_IPV4_CIDR = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
 PROJECT_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
-SPA_ROUTES = ("/map", "/explorer", "/agents", "/targets", "/ports", "/banners", "/tags", "/api")
+SPA_ROUTES = (
+    "/map",
+    "/charts",
+    "/explorer",
+    "/agents",
+    "/targets",
+    "/ports",
+    "/banners",
+    "/tags",
+    "/catalog",
+    "/api",
+)
 STATIC_CONTENT_TYPE_OVERRIDES = {
     ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript; charset=utf-8",
@@ -3258,6 +3269,15 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
       flex-wrap: wrap;
       margin: 12px 0;
     }
+    input[type="text"] {
+      min-width: 240px;
+      background: #020617;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 0.88rem;
+    }
     button, a.btn {
       border: 1px solid #334155;
       background: #1e293b;
@@ -3281,17 +3301,36 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
       margin-top: 8px;
       resize: vertical;
     }
+    .warning {
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 12px;
+      color: #fcd34d;
+      font-size: 0.86rem;
+    }
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 0.74rem;
+      border: 1px solid #334155;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Cluster Agents</h1>
-    <p class="muted">Monitor de agentes + CA export para onboarding rapido.</p>
+    <p class="muted">Monitor de agentes + onboarding con token.</p>
     <div id="summary" class="grid"></div>
     <table>
       <thead>
         <tr>
           <th>Agent</th>
+          <th>Auth</th>
           <th>Status</th>
           <th>Last Seen</th>
           <th>Client</th>
@@ -3302,23 +3341,41 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
       <tbody id="agents-body"></tbody>
     </table>
 
-    <h2 style="margin-top:26px;">CA Distribution</h2>
+    <h2 style="margin-top:26px;">Agent Onboarding</h2>
     <div class="toolbar">
-      <button id="copy-oneline">Copy CA one-line</button>
-      <button id="copy-export">Copy export command</button>
-      <a class="btn" href="/api/cluster/ca/raw" download>Download CA (.pem)</a>
+      <input id="new-agent-id" type="text" placeholder="agent_id opcional (ej: edge-havana-01)">
+      <button id="create-agent-credential">Agregar agente</button>
+      <button id="copy-agent-output">Copiar datos</button>
     </div>
-    <label class="k">CA one-line (`PORTHOUND_CA_ONELINE`)</label>
-    <textarea id="ca-oneline" readonly></textarea>
-    <label class="k" style="display:block; margin-top:12px;">Terminal export command</label>
-    <textarea id="ca-export" readonly></textarea>
+    <label class="k">Credenciales nuevas (mostrar una sola vez)</label>
+    <textarea id="new-agent-output" readonly></textarea>
+    <div class="warning">
+      Este cluster opera solo por HTTP interno y autenticacion `agent_id + token`.
+    </div>
+
+    <h3 style="margin-top:20px;">Credenciales registradas</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Agent</th>
+          <th>Status</th>
+          <th>Last Used</th>
+          <th>Updated</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="credentials-body"></tbody>
+    </table>
+
   </div>
 
   <script>
     const summaryEl = document.getElementById("summary");
     const agentsBody = document.getElementById("agents-body");
-    const caOneLineEl = document.getElementById("ca-oneline");
-    const caExportEl = document.getElementById("ca-export");
+    const credentialsBody = document.getElementById("credentials-body");
+    const newAgentIdEl = document.getElementById("new-agent-id");
+    const newAgentOutputEl = document.getElementById("new-agent-output");
 
     function escapeHtml(value) {
       return String(value || "")
@@ -3353,8 +3410,10 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
           return `${tid} - ${target} - ${task.lease_seconds_left || 0}s`;
         }).join("\\n");
         const status = String(row.status || "").toLowerCase();
+        const authMode = String(row.auth_mode || "token").toLowerCase();
         return `<tr>
           <td>${escapeHtml(row.agent_id)}</td>
+          <td><span class="badge">${escapeHtml(authMode)}</span></td>
           <td><span class="status ${escapeHtml(status)}">${escapeHtml(status || "-")}</span></td>
           <td>${escapeHtml(row.last_seen_iso || "-")}<br><span class="k">${escapeHtml(row.seconds_since_seen)}s ago</span></td>
           <td>${escapeHtml((row.client || []).join(":"))}</td>
@@ -3372,20 +3431,165 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
         renderAgents(payload.datas || []);
       } catch (err) {
         renderSummary({});
-        agentsBody.innerHTML = `<tr><td colspan="6">Failed loading agents: ${escapeHtml(err)}</td></tr>`;
+        agentsBody.innerHTML = `<tr><td colspan="7">Failed loading agents: ${escapeHtml(err)}</td></tr>`;
       }
     }
 
-    async function loadCA() {
-      try {
-        const res = await fetch("/api/cluster/ca");
-        const payload = await res.json();
-        caOneLineEl.value = payload.ca_oneline || "";
-        caExportEl.value = payload.export_command || "";
-      } catch (err) {
-        caOneLineEl.value = "";
-        caExportEl.value = "";
+    function buildSuggestedMasterBase() {
+      const protocol = "http:";
+      const rawHost = String(location.hostname || "").trim().toLowerCase();
+      const port = String(location.port || "").trim();
+      let safeHost = rawHost;
+      if (!safeHost || safeHost === "0.0.0.0" || safeHost === "::") {
+        safeHost = "127.0.0.1";
       }
+      const hostPort = port ? `${safeHost}:${port}` : safeHost;
+      return `${protocol}//${hostPort}`;
+    }
+
+    function isIPv4(value) {
+      return /^\\d{1,3}(?:\\.\\d{1,3}){3}$/.test(String(value || "").trim());
+    }
+
+    function encodeBase64Unicode(text) {
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(String(text || ""));
+      let binary = "";
+      bytes.forEach((b) => {
+        binary += String.fromCharCode(b);
+      });
+      return btoa(binary);
+    }
+
+    function buildAgentEnrollPayload(credential) {
+      const masterBase = buildSuggestedMasterBase();
+      let masterHost = "";
+      let masterIp = "";
+      try {
+        const url = new URL(masterBase);
+        masterHost = String(url.hostname || "").trim();
+      } catch (err) {
+        masterHost = String(location.hostname || "").trim();
+      }
+      if (isIPv4(masterHost)) {
+        masterIp = masterHost;
+      }
+      return {
+        version: 1,
+        master: masterBase,
+        master_host: masterHost,
+        master_ip: masterIp,
+        agent_id: String(credential.agent_id || ""),
+        agent_token: String(credential.token || credential.agent_key || ""),
+        agent_poll_seconds: 8,
+        agent_http_timeout: 20,
+        agent_tls_check_hostname: 0,
+      };
+    }
+
+    function buildAgentOnboardingText(credential) {
+      if (!credential) return "";
+      const masterBase = buildSuggestedMasterBase();
+      const agentId = String(credential.agent_id || "");
+      const token = String(credential.token || credential.agent_key || "");
+      const enrollPayload = buildAgentEnrollPayload(credential);
+      const enrollJson = JSON.stringify(enrollPayload);
+      const enrollBase64 = encodeBase64Unicode(enrollJson);
+      const quickCommand = [
+        "env/bin/python manage.py",
+        "--role agent",
+        `--master '${masterBase}'`,
+        `--agent-id '${agentId}'`,
+        `--agent-token '${token}'`,
+      ].join(" ");
+      return [
+        "MASTER WEB -> AGREGAR AGENTE (copiar y guardar):",
+        `master: ${masterBase}`,
+        `agent_id: ${agentId}`,
+        `token: ${token}`,
+        "",
+        "ENROLL BASE64 (contiene JSON con todo lo necesario):",
+        enrollBase64,
+        "",
+        "COMANDO RAPIDO BASE64 (copiar/pegar en el agente):",
+        `env/bin/python manage.py agent --enroll '${enrollBase64}'`,
+        "",
+        "COMANDO RAPIDO (copiar/pegar en el agente):",
+        quickCommand,
+        "",
+        "En el agente (recomendado):",
+        "env/bin/python manage.py --interactive",
+        "",
+        "Respuestas para el wizard del agente:",
+        "Role (master/agent/standalone): agent",
+        `Master URL (http://host:port): ${masterBase}`,
+        `Agent identifier: ${agentId}`,
+        `Agent token: ${token}`,
+        "Poll seconds: 8",
+        "HTTP timeout (seconds): 20",
+        "",
+        "Si quieres por variables de entorno:",
+        `export PORTHOUND_ROLE='agent'`,
+        `export PORTHOUND_MASTER='${masterBase}'`,
+        `export PORTHOUND_AGENT_ID='${agentId}'`,
+        `export PORTHOUND_AGENT_TOKEN='${token}'`,
+        "env/bin/python manage.py",
+      ].join("\\n");
+    }
+
+    function renderCredentials(rows) {
+      const data = Array.isArray(rows) ? rows : [];
+      credentialsBody.innerHTML = data.map((row) => {
+        const active = Boolean(row.active);
+        return `<tr>
+          <td>${escapeHtml(row.id)}</td>
+          <td>${escapeHtml(row.agent_id)}</td>
+          <td><span class="badge">${escapeHtml(active ? "active" : "inactive")}</span></td>
+          <td>${escapeHtml(row.last_used_at || "-")}</td>
+          <td>${escapeHtml(row.updated_at || "-")}</td>
+          <td>${active ? `<button data-revoke-id="${escapeHtml(row.id)}">Disable</button>` : "-"}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    async function loadCredentials() {
+      try {
+        const res = await fetch("/api/cluster/agent/credentials");
+        const payload = await res.json();
+        renderCredentials(payload.datas || []);
+      } catch (err) {
+        credentialsBody.innerHTML = `<tr><td colspan="6">Failed loading credentials: ${escapeHtml(err)}</td></tr>`;
+      }
+    }
+
+    async function createCredential() {
+      const agentId = String(newAgentIdEl.value || "").trim();
+      const body = agentId ? { agent_id: agentId } : {};
+      const res = await fetch("/api/cluster/agent/credentials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        throw new Error(payload.status || `HTTP ${res.status}`);
+      }
+      const credential = payload.credential || {};
+      newAgentOutputEl.value = buildAgentOnboardingText(credential);
+      await loadCredentials();
+    }
+
+    async function revokeCredentialById(credentialId) {
+      const res = await fetch("/api/cluster/agent/credentials", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: credentialId }),
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        throw new Error(payload.status || `HTTP ${res.status}`);
+      }
+      await loadCredentials();
     }
 
     async function copyText(value) {
@@ -3395,12 +3599,30 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
       } catch (err) {}
     }
 
-    document.getElementById("copy-oneline").addEventListener("click", () => copyText(caOneLineEl.value));
-    document.getElementById("copy-export").addEventListener("click", () => copyText(caExportEl.value));
+    document.getElementById("copy-agent-output").addEventListener("click", () => copyText(newAgentOutputEl.value));
+    document.getElementById("create-agent-credential").addEventListener("click", async () => {
+      try {
+        await createCredential();
+      } catch (err) {
+        newAgentOutputEl.value = `Error: ${String(err)}`;
+      }
+    });
+    credentialsBody.addEventListener("click", async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const revokeId = target.getAttribute("data-revoke-id");
+      if (!revokeId) return;
+      try {
+        await revokeCredentialById(Number(revokeId));
+      } catch (err) {
+        newAgentOutputEl.value = `Error: ${String(err)}`;
+      }
+    });
 
     loadAgents();
-    loadCA();
+    loadCredentials();
     setInterval(loadAgents, 4000);
+    setInterval(loadCredentials, 15000);
   </script>
 </body>
 </html>
@@ -3408,8 +3630,21 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
 
 API_ENDPOINTS = [
     {"method": "GET", "path": "/api/dashboard/", "desc": "Frontend dashboard snapshot."},
+    {"method": "GET", "path": "/api/charts/analytics", "desc": "Aggregated analytics series for chart dashboards."},
     {"method": "GET", "path": "/api/endpoints/", "desc": "Endpoint catalog."},
     {"method": "GET", "path": "/api/map/scan", "desc": "Geolocated scan map snapshot."},
+    {"method": "GET", "path": "/api/catalog/banner-rules/", "desc": "List regex banner rules (builtin + custom)."},
+    {"method": "POST", "path": "/api/catalog/banner-rules/", "desc": "Create custom regex banner rule."},
+    {"method": "PUT", "path": "/api/catalog/banner-rules/", "desc": "Update custom regex banner rule."},
+    {"method": "DELETE", "path": "/api/catalog/banner-rules/", "desc": "Delete custom regex banner rule."},
+    {"method": "GET", "path": "/api/catalog/banner-requests/", "desc": "List banner probe requests (builtin + custom)."},
+    {"method": "POST", "path": "/api/catalog/banner-requests/", "desc": "Create custom banner probe request."},
+    {"method": "PUT", "path": "/api/catalog/banner-requests/", "desc": "Update custom banner probe request."},
+    {"method": "DELETE", "path": "/api/catalog/banner-requests/", "desc": "Delete custom banner probe request."},
+    {"method": "GET", "path": "/api/catalog/ip-presets/", "desc": "List IP presets (builtin + custom)."},
+    {"method": "POST", "path": "/api/catalog/ip-presets/", "desc": "Create custom IP preset."},
+    {"method": "PUT", "path": "/api/catalog/ip-presets/", "desc": "Update custom IP preset."},
+    {"method": "DELETE", "path": "/api/catalog/ip-presets/", "desc": "Delete custom IP preset."},
     {"method": "GET", "path": "/", "desc": "Counts summary."},
     {"method": "GET", "path": "/protocols/", "desc": "Supported target protocols."},
     {"method": "GET", "path": "/targets/", "desc": "List targets."},
@@ -3443,10 +3678,16 @@ API_ENDPOINTS = [
     {"method": "POST", "path": "/api/chat/clear", "desc": "Clear chat messages."},
     {"method": "GET", "path": "/cluster/agents/", "desc": "Cluster agents web view."},
     {"method": "GET", "path": "/api/cluster/agents", "desc": "List agents and status."},
-    {"method": "GET", "path": "/api/cluster/ca", "desc": "CA payload + one-line env value."},
-    {"method": "GET", "path": "/api/cluster/ca/raw", "desc": "Download CA certificate PEM file."},
-    {"method": "GET", "path": "/api/cluster/ca/oneline", "desc": "Plain-text CA one-line value."},
-    {"method": "POST", "path": "/api/cluster/agent/register", "desc": "Register an agent over mTLS."},
+    {"method": "GET", "path": "/api/cluster/agent/credentials", "desc": "List agent token credentials."},
+    {"method": "POST", "path": "/api/cluster/agent/credentials", "desc": "Create or rotate an agent token credential."},
+    {"method": "DELETE", "path": "/api/cluster/agent/credentials", "desc": "Disable an agent token credential."},
+    {"method": "POST", "path": "/api/cluster/agent/control", "desc": "Control an agent (stop/delete)."},
+    {"method": "GET", "path": "/api/cluster/ca", "desc": "Deprecated (TLS disabled)."},
+    {"method": "GET", "path": "/api/cluster/ca/raw", "desc": "Deprecated (TLS disabled)."},
+    {"method": "GET", "path": "/api/cluster/ca/oneline", "desc": "Deprecated (TLS disabled)."},
+    {"method": "POST", "path": "/api/cluster/agent/enroll", "desc": "Deprecated (certificate enrollment disabled)."},
+    {"method": "POST", "path": "/api/cluster/agent/register", "desc": "Register an agent (agent_id + token)."},
+    {"method": "POST", "path": "/api/cluster/agent/heartbeat", "desc": "Agent heartbeat and lease renewal while executing task."},
     {"method": "POST", "path": "/api/cluster/agent/task/pull", "desc": "Agent pulls next scan task."},
     {"method": "POST", "path": "/api/cluster/agent/task/submit", "desc": "Agent submits scan results."},
 ]
@@ -3643,6 +3884,55 @@ def require_agent_mtls(request):
     return json_error("Client certificate required", status=401)
 
 
+def _extract_agent_token(payload):
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("token", "agent_token", "agent_key", "shared_key", "key"):
+        value = str(payload.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _extract_agent_key(payload):
+    return _extract_agent_token(payload)
+
+
+def authenticate_cluster_agent_shared_key(payload, expected_agent_id=""):
+    data = payload if isinstance(payload, dict) else {}
+    expected = str(expected_agent_id or "").strip()
+
+    resolved_agent_id = str(data.get("agent_id", "") or "").strip() or expected
+    if not resolved_agent_id:
+        return None, json_error("agent_id is required", status=400)
+    if expected and resolved_agent_id != expected:
+        return None, json_error("agent_id mismatch", status=403)
+
+    agent_key = _extract_agent_token(data)
+    if not agent_key:
+        return None, json_error("token is required", status=401)
+    if not scan_db.verify_cluster_agent_shared_key(
+        resolved_agent_id,
+        agent_key,
+        touch_last_used=True,
+    ):
+        return None, json_error("Invalid agent_id or token", status=401)
+    return {
+        "agent_id": resolved_agent_id,
+        "cert_cn": "",
+        "auth_mode": "token",
+    }, None
+
+
+def authenticate_cluster_agent(request, payload, expected_agent_id=""):
+    data = payload if isinstance(payload, dict) else {}
+    _ = request
+    return authenticate_cluster_agent_shared_key(
+        data,
+        expected_agent_id=expected_agent_id,
+    )
+
+
 def ca_pem_to_oneline(pem_text):
     raw = str(pem_text or "").strip()
     if not raw:
@@ -3733,6 +4023,40 @@ def resolve_ca_file_path(required=False):
             raise RuntimeError(f"CA file not found: {configured_path}")
         raise RuntimeError("PORTHOUND_CA or PORTHOUND_CA_ONELINE is required")
     return ""
+
+
+def resolve_ca_key_file_path(required=False):
+    explicit_path = str(getattr(settings, "PORTHOUND_CA_KEY", "") or "").strip()
+    if explicit_path and Path(explicit_path).is_file():
+        return explicit_path
+
+    ca_file = str(resolve_ca_file_path(required=required) or "").strip()
+    if ca_file:
+        ca_path = Path(ca_file)
+        candidate_names = []
+        if ".cert." in ca_path.name:
+            candidate_names.append(ca_path.name.replace(".cert.", ".key.", 1))
+        candidate_names.append("ca.key.pem")
+        for name in candidate_names:
+            candidate = ca_path.with_name(name)
+            if candidate.is_file():
+                return str(candidate)
+
+    if required:
+        if explicit_path:
+            raise RuntimeError(f"CA key file not found: {explicit_path}")
+        raise RuntimeError(
+            "PORTHOUND_CA_KEY is required for enrollment signing "
+            "(or place ca.key.pem next to the CA cert)"
+        )
+    return ""
+
+
+def issue_agent_client_certificate(agent_id: str, days_valid=825):
+    _ = (agent_id, days_valid)
+    raise RuntimeError(
+        "Certificate enrollment is disabled. Use agent_id + token over HTTP."
+    )
 
 
 def _cluster_cleanup_expired_leases(now_ts=None):
@@ -3845,6 +4169,32 @@ def release_task_lease(target_id, task_id="", agent_id=""):
         cluster_leases.pop(target_int, None)
 
 
+def renew_task_lease(target_id, task_id="", agent_id="", lease_seconds=None):
+    try:
+        target_int = int(target_id)
+    except Exception:
+        return False
+    now_ts = time.time()
+    renew_seconds = int(
+        lease_seconds
+        or getattr(settings, "AGENT_TASK_LEASE_SECONDS", 300)
+        or 300
+    )
+    renew_seconds = max(30, renew_seconds)
+    with cluster_lock:
+        lease = cluster_leases.get(target_int)
+        if not lease:
+            return False
+        if task_id and str(lease.get("task_id", "")) != str(task_id):
+            return False
+        if agent_id and str(lease.get("agent_id", "")) != str(agent_id):
+            return False
+        lease["lease_until"] = now_ts + renew_seconds
+        lease["heartbeat_at"] = now_ts
+        cluster_leases[target_int] = lease
+    return True
+
+
 def _agent_status_from_age(seconds_since_seen):
     poll_seconds = max(2, int(getattr(settings, "AGENT_POLL_SECONDS", 8) or 8))
     online_limit = max(15, poll_seconds * 3)
@@ -3919,6 +4269,7 @@ def build_cluster_agents_snapshot():
             "last_seen_iso": utc_iso(int(last_seen)) if last_seen > 0 else "",
             "seconds_since_seen": round(age, 2),
             "certificate_cn": str((meta or {}).get("cn", "")).strip(),
+            "auth_mode": str((meta or {}).get("auth_mode", "token") or "token").strip().lower(),
             "client": (meta or {}).get("client"),
             "active_tasks": tasks,
             "active_task_count": len(tasks),
@@ -4319,6 +4670,249 @@ def build_dashboard(example=False):
     }
 
 
+def _safe_float_value(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _extract_day_key(raw_timestamp):
+    text = str(raw_timestamp or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _counter_to_series(counter_obj, limit=0):
+    entries = [
+        (str(key), int(value))
+        for key, value in dict(counter_obj or {}).items()
+        if str(key).strip() and int(value or 0) > 0
+    ]
+    entries.sort(key=lambda item: (-int(item[1]), str(item[0])))
+    if int(limit or 0) > 0:
+        entries = entries[: int(limit)]
+    return [{"label": key, "value": value} for key, value in entries]
+
+
+def build_chart_analytics(example=False):
+    if example:
+        targets = list(EXAMPLE_TARGETS)
+        ports = list(EXAMPLE_PORTS)
+        banners = list(EXAMPLE_BANNERS)
+        tags = list(EXAMPLE_TAGS)
+        favicons = list(EXAMPLE_FAVICONS)
+    else:
+        targets = scan_db.select_targets()
+        ports = scan_db.select_ports()
+        banners = scan_db.select_banners()
+        tags = scan_db.select_tags()
+        favicons = scan_db.select_favicons()
+
+    unique_hosts = set()
+    port_proto_counter = Counter()
+    port_state_by_proto = {}
+    open_ports_counter = Counter()
+    open_ip_counter = Counter()
+    risk_port_counter = Counter()
+    day_ports_counter = Counter()
+    day_targets_counter = Counter()
+    open_ports_total = 0
+    filtered_ports_total = 0
+
+    risky_ports = {
+        20,
+        21,
+        22,
+        23,
+        25,
+        53,
+        80,
+        110,
+        111,
+        135,
+        139,
+        143,
+        389,
+        443,
+        445,
+        1433,
+        1521,
+        3306,
+        3389,
+        5432,
+        5900,
+        6379,
+        8080,
+        9200,
+    }
+
+    for row in ports:
+        proto = str((row or {}).get("proto", "") or "unknown").strip().lower() or "unknown"
+        state = str((row or {}).get("state", "") or "unknown").strip().lower() or "unknown"
+        ip_value = str((row or {}).get("ip", "") or "").strip()
+        if ip_value:
+            unique_hosts.add(ip_value)
+        port_proto_counter[proto] += 1
+        bucket = port_state_by_proto.setdefault(
+            proto,
+            {"proto": proto, "open": 0, "filtered": 0, "other": 0},
+        )
+        if state == "open":
+            bucket["open"] += 1
+            open_ports_total += 1
+            try:
+                port_number = int((row or {}).get("port", 0) or 0)
+            except Exception:
+                port_number = 0
+            if port_number > 0:
+                open_ports_counter[str(port_number)] += 1
+                if ip_value:
+                    open_ip_counter[ip_value] += 1
+                if port_number in risky_ports:
+                    risk_port_counter[str(port_number)] += 1
+        elif state == "filtered":
+            bucket["filtered"] += 1
+            filtered_ports_total += 1
+        else:
+            bucket["other"] += 1
+
+        day_key = _extract_day_key((row or {}).get("created_at"))
+        if day_key:
+            day_ports_counter[day_key] += 1
+
+    target_status_counter = Counter()
+    target_type_counter = Counter()
+    target_proto_counter = Counter()
+    target_progress_buckets = {
+        "0-24": 0,
+        "25-49": 0,
+        "50-74": 0,
+        "75-99": 0,
+        "100": 0,
+    }
+    for row in targets:
+        status = str((row or {}).get("status", "") or "active").strip().lower() or "active"
+        target_type = str((row or {}).get("type", "") or "common").strip().lower() or "common"
+        target_proto = str((row or {}).get("proto", "") or "tcp").strip().lower() or "tcp"
+        target_status_counter[status] += 1
+        target_type_counter[target_type] += 1
+        target_proto_counter[target_proto] += 1
+
+        progress = _safe_float_value((row or {}).get("progress"), default=0.0)
+        if progress >= 100.0:
+            target_progress_buckets["100"] += 1
+        elif progress >= 75.0:
+            target_progress_buckets["75-99"] += 1
+        elif progress >= 50.0:
+            target_progress_buckets["50-74"] += 1
+        elif progress >= 25.0:
+            target_progress_buckets["25-49"] += 1
+        else:
+            target_progress_buckets["0-24"] += 1
+
+        day_key = _extract_day_key((row or {}).get("created_at"))
+        if day_key:
+            day_targets_counter[day_key] += 1
+
+    banner_proto_counter = Counter()
+    banner_length_buckets = {
+        "0-64": 0,
+        "65-128": 0,
+        "129-256": 0,
+        "257-512": 0,
+        "513+": 0,
+    }
+    day_banners_counter = Counter()
+    for row in banners:
+        proto = str((row or {}).get("proto", "") or "unknown").strip().lower() or "unknown"
+        banner_proto_counter[proto] += 1
+        plain = str((row or {}).get("response_plain", "") or "")
+        length = len(plain)
+        if length <= 64:
+            banner_length_buckets["0-64"] += 1
+        elif length <= 128:
+            banner_length_buckets["65-128"] += 1
+        elif length <= 256:
+            banner_length_buckets["129-256"] += 1
+        elif length <= 512:
+            banner_length_buckets["257-512"] += 1
+        else:
+            banner_length_buckets["513+"] += 1
+        day_key = _extract_day_key((row or {}).get("created_at"))
+        if day_key:
+            day_banners_counter[day_key] += 1
+
+    tag_key_counter = Counter()
+    tag_service_value_counter = Counter()
+    for row in tags:
+        key = str((row or {}).get("key", "") or "").strip().lower()
+        value = str((row or {}).get("value", "") or "").strip()
+        if not key:
+            continue
+        tag_key_counter[key] += 1
+        if key in {"service", "product", "server", "vendor", "framework", "runtime"} and value:
+            normalized = value if len(value) <= 60 else f"{value[:57]}..."
+            tag_service_value_counter[normalized] += 1
+
+    all_days = sorted(
+        set(day_ports_counter.keys())
+        | set(day_banners_counter.keys())
+        | set(day_targets_counter.keys())
+    )
+    if len(all_days) > 30:
+        all_days = all_days[-30:]
+    timeline = [
+        {
+            "day": day_value,
+            "ports": int(day_ports_counter.get(day_value, 0)),
+            "banners": int(day_banners_counter.get(day_value, 0)),
+            "targets": int(day_targets_counter.get(day_value, 0)),
+        }
+        for day_value in all_days
+    ]
+
+    ports_state_matrix = sorted(
+        list(port_state_by_proto.values()),
+        key=lambda item: str((item or {}).get("proto", "")),
+    )
+
+    return {
+        "generated_at": utc_iso(int(time.time())),
+        "summary": {
+            "targets": len(targets),
+            "ports": len(ports),
+            "banners": len(banners),
+            "tags": len(tags),
+            "favicons": len(favicons),
+            "unique_hosts": len(unique_hosts),
+            "open_ports": int(open_ports_total),
+            "filtered_ports": int(filtered_ports_total),
+        },
+        "ports_by_proto": _counter_to_series(port_proto_counter),
+        "ports_state_by_proto": ports_state_matrix,
+        "top_open_ports": _counter_to_series(open_ports_counter, limit=12),
+        "top_ips_by_open_ports": _counter_to_series(open_ip_counter, limit=12),
+        "risk_ports": _counter_to_series(risk_port_counter, limit=12),
+        "targets_by_status": _counter_to_series(target_status_counter),
+        "targets_by_type": _counter_to_series(target_type_counter),
+        "targets_by_proto": _counter_to_series(target_proto_counter),
+        "target_progress_buckets": [
+            {"label": label, "value": int(target_progress_buckets.get(label, 0))}
+            for label in ["0-24", "25-49", "50-74", "75-99", "100"]
+        ],
+        "banners_by_proto": _counter_to_series(banner_proto_counter),
+        "banner_length_buckets": [
+            {"label": label, "value": int(banner_length_buckets.get(label, 0))}
+            for label in ["0-64", "65-128", "129-256", "257-512", "513+"]
+        ],
+        "top_tag_keys": _counter_to_series(tag_key_counter, limit=10),
+        "top_service_signatures": _counter_to_series(tag_service_value_counter, limit=10),
+        "timeline": timeline,
+    }
+
+
 @app.view("/")
 def root_view(request):
     if is_example(request):
@@ -4428,7 +5022,11 @@ def target_handler(request):
         admin_error = require_admin_access(request)
         if admin_error:
             return admin_error
-        item = request.json() or {}
+        item = request.json()
+        if item is None:
+            raise ValueError("Invalid JSON body")
+        if not isinstance(item, dict):
+            raise ValueError("Invalid target body")
         if is_example(request):
             if request.method == "POST":
                 return {**EXAMPLE_TARGETS[0], "example": True}
@@ -4445,10 +5043,15 @@ def target_handler(request):
             scan_db.update_targets(data=item)
             return item
         if request.method == "DELETE":
-            item["id"] = int(item["id"])
-            scan_db.delete_target(data=item)
-            return item
+            try:
+                target_id = int(item.get("id"))
+            except Exception:
+                raise ValueError("Invalid target id")
+            scan_db.delete_target(data={"id": target_id})
+            return {"id": target_id}
         return json_error("Method not allowed", status=405)
+    except ValueError as e:
+        return json_error(e, status=400)
     except Exception as e:
         return json_error(e, status=500)
 
@@ -5029,9 +5632,114 @@ def api_dashboard(request):
     return build_dashboard(example=is_example(request))
 
 
+@app.api("/api/charts/analytics", methods=["GET"])
+def api_charts_analytics(request):
+    try:
+        return build_chart_analytics(example=is_example(request))
+    except Exception as exc:
+        return json_error(exc, status=500)
+
+
 @app.api("/api/endpoints/", methods=["GET"])
 def api_endpoints(request):
     return {"datas": API_ENDPOINTS}
+
+
+def _catalog_exception_response(exc):
+    if isinstance(exc, PermissionError):
+        return json_error(exc, status=403)
+    if isinstance(exc, sqlite3.IntegrityError):
+        return json_error("Duplicate value", status=409)
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        if "not found" in message.lower():
+            return json_error(message, status=404)
+        return json_error(message, status=400)
+    return json_error(exc, status=500)
+
+
+@app.api("/api/catalog/banner-rules/", methods=["GET", "POST", "PUT", "DELETE"])
+def api_catalog_banner_rules(request):
+    try:
+        if request.method == "GET":
+            include_inactive = request.query.get("include_inactive", "1")
+            include_inactive = bool(str(include_inactive).strip() not in {"0", "false", "no"})
+            return {"datas": scan_db.select_banner_regex_rules(include_inactive=include_inactive)}
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        if request.method == "POST":
+            row = scan_db.insert_banner_regex_rule(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "PUT":
+            row = scan_db.update_banner_regex_rule(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "DELETE":
+            scan_db.delete_banner_regex_rule(payload)
+            return {"status": "ok"}
+        return json_error("Method not allowed", status=405)
+    except Exception as exc:
+        return _catalog_exception_response(exc)
+
+
+@app.api("/api/catalog/banner-requests/", methods=["GET", "POST", "PUT", "DELETE"])
+def api_catalog_banner_requests(request):
+    try:
+        if request.method == "GET":
+            include_inactive = request.query.get("include_inactive", "1")
+            include_inactive = bool(str(include_inactive).strip() not in {"0", "false", "no"})
+            proto = str(request.query.get("proto", "") or "").strip().lower()
+            return {
+                "datas": scan_db.select_banner_probe_requests(
+                    proto=proto,
+                    include_inactive=include_inactive,
+                )
+            }
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        if request.method == "POST":
+            row = scan_db.insert_banner_probe_request(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "PUT":
+            row = scan_db.update_banner_probe_request(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "DELETE":
+            scan_db.delete_banner_probe_request(payload)
+            return {"status": "ok"}
+        return json_error("Method not allowed", status=405)
+    except Exception as exc:
+        return _catalog_exception_response(exc)
+
+
+@app.api("/api/catalog/ip-presets/", methods=["GET", "POST", "PUT", "DELETE"])
+def api_catalog_ip_presets(request):
+    try:
+        if request.method == "GET":
+            include_inactive = request.query.get("include_inactive", "1")
+            include_inactive = bool(str(include_inactive).strip() not in {"0", "false", "no"})
+            return {"datas": scan_db.select_ip_presets(include_inactive=include_inactive)}
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        if request.method == "POST":
+            row = scan_db.insert_ip_preset(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "PUT":
+            row = scan_db.update_ip_preset(payload)
+            return {"status": "ok", "data": row}
+        if request.method == "DELETE":
+            scan_db.delete_ip_preset(payload)
+            return {"status": "ok"}
+        return json_error("Method not allowed", status=405)
+    except Exception as exc:
+        return _catalog_exception_response(exc)
 
 
 @app.api("/api/map/scan", methods=["GET"])
@@ -5244,80 +5952,164 @@ def api_cluster_agents(request):
     return build_cluster_agents_snapshot()
 
 
-@app.api("/api/cluster/ca", methods=["GET"])
-def api_cluster_ca(request):
+@app.api("/api/cluster/agent/credentials", methods=["GET"])
+def api_cluster_agent_credentials_list(request):
     if not is_master_role():
-        return json_error("Only master role exposes CA distribution", status=403)
+        return json_error("Only master role manages agent credentials", status=403)
     admin_error = require_admin_access(request)
     if admin_error:
         return admin_error
+    scan_db.create_tables()
+    return {"datas": scan_db.select_cluster_agent_credentials(include_inactive=True)}
+
+
+@app.api("/api/cluster/agent/credentials", methods=["POST"])
+def api_cluster_agent_credentials_create(request):
+    if not is_master_role():
+        return json_error("Only master role manages agent credentials", status=403)
+    admin_error = require_admin_access(request)
+    if admin_error:
+        return admin_error
+    scan_db.create_tables()
+    payload = request.json() or {}
     try:
-        return build_ca_distribution_payload()
+        item = scan_db.create_cluster_agent_credential(payload)
+    except ValueError as exc:
+        return json_error(exc, status=400)
     except Exception as exc:
-        return json_error(exc, status=404)
+        return json_error(exc, status=500)
+    return {"status": "ok", "credential": item}
+
+
+@app.api("/api/cluster/agent/credentials", methods=["DELETE"])
+def api_cluster_agent_credentials_revoke(request):
+    if not is_master_role():
+        return json_error("Only master role manages agent credentials", status=403)
+    admin_error = require_admin_access(request)
+    if admin_error:
+        return admin_error
+    scan_db.create_tables()
+    payload = request.json() or {}
+    try:
+        item = scan_db.revoke_cluster_agent_credential(payload)
+    except ValueError as exc:
+        return json_error(exc, status=400)
+    except Exception as exc:
+        return json_error(exc, status=500)
+    return {"status": "ok", "credential": item}
+
+
+@app.api("/api/cluster/agent/control", methods=["POST"])
+def api_cluster_agent_control(request):
+    if not is_master_role():
+        return json_error("Only master role manages agents", status=403)
+    admin_error = require_admin_access(request)
+    if admin_error:
+        return admin_error
+    scan_db.create_tables()
+
+    payload = request.json() or {}
+    action = str(payload.get("action", "") or "").strip().lower()
+    if action not in {"stop", "delete"}:
+        return json_error("action must be stop or delete", status=400)
+    agent_id = str(payload.get("agent_id", "") or "").strip()
+    if not agent_id:
+        return json_error("agent_id is required", status=400)
+
+    released_target_ids = []
+    removed_agent = False
+    with cluster_lock:
+        for target_id, lease in list(cluster_leases.items()):
+            if str((lease or {}).get("agent_id", "")).strip() != agent_id:
+                continue
+            released_target_ids.append(int(target_id))
+            cluster_leases.pop(target_id, None)
+
+        if action == "delete":
+            removed_agent = bool(cluster_agents.pop(agent_id, None))
+        else:
+            existing = cluster_agents.get(agent_id)
+            if existing:
+                existing["last_seen"] = 0.0
+                existing["status_note"] = "stopped_by_admin"
+                cluster_agents[agent_id] = existing
+
+    credential = {}
+    try:
+        if action == "delete":
+            credential = scan_db.delete_cluster_agent_credential({"agent_id": agent_id})
+        else:
+            credential = scan_db.revoke_cluster_agent_credential({"agent_id": agent_id})
+    except ValueError:
+        credential = {}
+    except Exception as exc:
+        return json_error(exc, status=500)
+
+    return {
+        "status": "ok",
+        "action": action,
+        "agent_id": agent_id,
+        "credential": credential,
+        "removed_agent": bool(removed_agent),
+        "released_target_ids": released_target_ids,
+        "released_leases": len(released_target_ids),
+    }
+
+
+@app.api("/api/cluster/ca", methods=["GET"])
+def api_cluster_ca(request):
+    _ = request
+    return json_error(
+        "TLS/CA distribution is disabled. Use HTTP + agent_id + token.",
+        status=410,
+    )
 
 
 @app.view("/api/cluster/ca/raw", methods=["GET"])
 def api_cluster_ca_raw(request):
-    if not is_master_role():
-        return Response.text("Forbidden", status=403)
-    admin_error = require_admin_access(request)
-    if admin_error:
-        return admin_error
-    try:
-        payload = build_ca_distribution_payload()
-        pem_text = str(payload.get("ca_pem", "") or "")
-        if not pem_text:
-            return Response.text("CA not configured", status=404)
-        return Response(
-            status=200,
-            body=pem_text.encode("utf-8"),
-            headers={
-                "Content-Type": "application/x-pem-file; charset=utf-8",
-                "Content-Disposition": 'attachment; filename="porthound-ca.pem"',
-                "Cache-Control": "no-store",
-            },
-        )
-    except Exception as exc:
-        return Response.text(str(exc), status=404)
+    _ = request
+    return Response.text(
+        "TLS/CA distribution is disabled. Use HTTP + agent_id + token.",
+        status=410,
+    )
 
 
 @app.view("/api/cluster/ca/oneline", methods=["GET"])
 def api_cluster_ca_oneline(request):
-    if not is_master_role():
-        return Response.text("Forbidden", status=403)
-    admin_error = require_admin_access(request)
-    if admin_error:
-        return admin_error
-    try:
-        payload = build_ca_distribution_payload()
-        one_line = str(payload.get("ca_oneline", "") or "")
-        if not one_line:
-            return Response.text("CA not configured", status=404)
-        return Response.text(one_line, status=200)
-    except Exception as exc:
-        return Response.text(str(exc), status=404)
+    _ = request
+    return Response.text(
+        "TLS/CA distribution is disabled. Use HTTP + agent_id + token.",
+        status=410,
+    )
+
+
+@app.api("/api/cluster/agent/enroll", methods=["POST"])
+def api_cluster_agent_enroll(request):
+    _ = request
+    return json_error(
+        "Agent enrollment via certificates is disabled. Use token authentication.",
+        status=410,
+    )
 
 
 @app.api("/api/cluster/agent/register", methods=["POST"])
 def api_cluster_agent_register(request):
     if not is_master_role():
         return json_error("Only master role accepts agent registration", status=403)
-    mtls_error = require_agent_mtls(request)
-    if mtls_error:
-        return mtls_error
-
     payload = request.json() or {}
-    cert_cn = request_peer_common_name(request)
-    agent_id = str(payload.get("agent_id", "") or cert_cn).strip()
-    if not agent_id:
-        return json_error("agent_id is required", status=400)
+    auth, auth_error = authenticate_cluster_agent(request, payload)
+    if auth_error:
+        return auth_error
+    agent_id = str(auth.get("agent_id", "")).strip()
+    cert_cn = str(auth.get("cert_cn", "")).strip()
+    auth_mode = str(auth.get("auth_mode", "")).strip().lower()
 
     now_ts = time.time()
     with cluster_lock:
         cluster_agents[agent_id] = {
             "agent_id": agent_id,
             "cn": cert_cn,
+            "auth_mode": auth_mode,
             "last_seen": now_ts,
             "client": request.client,
         }
@@ -5330,24 +6122,96 @@ def api_cluster_agent_register(request):
     }
 
 
+@app.api("/api/cluster/agent/heartbeat", methods=["POST"])
+def api_cluster_agent_heartbeat(request):
+    if not is_master_role():
+        return json_error("Only master role accepts agent heartbeat", status=403)
+    payload = request.json() or {}
+    auth, auth_error = authenticate_cluster_agent(request, payload)
+    if auth_error:
+        return auth_error
+    agent_id = str(auth.get("agent_id", "")).strip()
+    cert_cn = str(auth.get("cert_cn", "")).strip()
+    auth_mode = str(auth.get("auth_mode", "")).strip().lower()
+
+    now_ts = time.time()
+    with cluster_lock:
+        existing = cluster_agents.get(agent_id, {})
+        cluster_agents[agent_id] = {
+            "agent_id": agent_id,
+            "cn": cert_cn,
+            "auth_mode": auth_mode,
+            "last_seen": now_ts,
+            "client": request.client,
+            "status_note": str((existing or {}).get("status_note", "")).strip(),
+        }
+
+    task_id = str(payload.get("task_id", "") or "").strip()
+    target_id_raw = payload.get("master_target_id")
+    lease_renewed = False
+    if task_id and target_id_raw not in (None, ""):
+        lease_renewed = bool(
+            renew_task_lease(
+                target_id=target_id_raw,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        )
+    desired_action = "continue"
+    target_status = ""
+    target_exists = None
+    target_id = None
+    try:
+        if target_id_raw not in (None, ""):
+            target_id = int(target_id_raw)
+    except Exception:
+        target_id = None
+    if target_id is not None:
+        target_row = scan_db.select_target_by_id(target_id)
+        if not target_row:
+            desired_action = "delete"
+            target_exists = False
+            release_task_lease(target_id, task_id=task_id, agent_id=agent_id)
+        else:
+            target_exists = True
+            target_status = str(target_row.get("status", "")).strip().lower()
+            if target_status == "stopped":
+                desired_action = "stop"
+                release_task_lease(target_id, task_id=task_id, agent_id=agent_id)
+            elif target_status == "restarting":
+                desired_action = "restart"
+                release_task_lease(target_id, task_id=task_id, agent_id=agent_id)
+            else:
+                desired_action = "continue"
+    if task_id and not lease_renewed and desired_action == "continue":
+        desired_action = "stop"
+    return {
+        "status": "ok",
+        "agent_id": agent_id,
+        "lease_renewed": bool(lease_renewed),
+        "desired_action": desired_action,
+        "target_status": target_status,
+        "target_exists": target_exists,
+    }
+
+
 @app.api("/api/cluster/agent/task/pull", methods=["POST"])
 def api_cluster_agent_task_pull(request):
     if not is_master_role():
         return json_error("Only master role schedules agent tasks", status=403)
-    mtls_error = require_agent_mtls(request)
-    if mtls_error:
-        return mtls_error
-
     payload = request.json() or {}
-    cert_cn = request_peer_common_name(request)
-    agent_id = str(payload.get("agent_id", "") or cert_cn).strip()
-    if not agent_id:
-        return json_error("agent_id is required", status=400)
+    auth, auth_error = authenticate_cluster_agent(request, payload)
+    if auth_error:
+        return auth_error
+    agent_id = str(auth.get("agent_id", "")).strip()
+    cert_cn = str(auth.get("cert_cn", "")).strip()
+    auth_mode = str(auth.get("auth_mode", "")).strip().lower()
 
     with cluster_lock:
         cluster_agents[agent_id] = {
             "agent_id": agent_id,
             "cn": cert_cn,
+            "auth_mode": auth_mode,
             "last_seen": time.time(),
             "client": request.client,
         }
@@ -5362,29 +6226,33 @@ def api_cluster_agent_task_pull(request):
 def api_cluster_agent_task_submit(request):
     if not is_master_role():
         return json_error("Only master role accepts task results", status=403)
-    mtls_error = require_agent_mtls(request)
-    if mtls_error:
-        return mtls_error
 
     try:
         payload = normalize_agent_result_payload(request.json() or {})
     except ValueError as exc:
         return json_error(exc, status=400)
+    auth, auth_error = authenticate_cluster_agent(
+        request,
+        payload,
+        expected_agent_id=payload.get("agent_id", ""),
+    )
+    if auth_error:
+        return auth_error
 
     target_id = int(payload["master_target_id"])
     target = scan_db.select_target_by_id(target_id)
     if not target:
         return json_error("Target not found", status=404)
 
-    submitted_agent_id = payload["agent_id"]
-    cert_cn = request_peer_common_name(request)
-    if cert_cn and cert_cn != submitted_agent_id:
-        return json_error("agent_id does not match client certificate", status=403)
+    submitted_agent_id = str(auth.get("agent_id", payload["agent_id"])).strip()
+    cert_cn = str(auth.get("cert_cn", "")).strip()
+    auth_mode = str(auth.get("auth_mode", "")).strip().lower()
 
     with cluster_lock:
         cluster_agents[submitted_agent_id] = {
             "agent_id": submitted_agent_id,
             "cn": cert_cn,
+            "auth_mode": auth_mode,
             "last_seen": time.time(),
             "client": request.client,
         }
@@ -5641,551 +6509,47 @@ def ws_handler(ws, request):
 
 
 def build_master_ssl_context():
-    if not bool(getattr(settings, "TLS_ENABLED", True)):
-        return None
-    cert_file = str(getattr(settings, "TLS_CERT_FILE", "") or "").strip()
-    key_file = str(getattr(settings, "TLS_KEY_FILE", "") or "").strip()
-    if not cert_file or not key_file:
-        raise RuntimeError("PORTHOUND_TLS_CERT_FILE and PORTHOUND_TLS_KEY_FILE are required")
-    if not Path(cert_file).is_file():
-        raise RuntimeError(f"Master cert file not found: {cert_file}")
-    if not Path(key_file).is_file():
-        raise RuntimeError(f"Master key file not found: {key_file}")
+    from master import build_master_ssl_context as master_build_master_ssl_context
 
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    if hasattr(ssl, "OP_NO_COMPRESSION"):
-        context.options |= ssl.OP_NO_COMPRESSION
-    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
-
-    require_client_cert = bool(getattr(settings, "TLS_REQUIRE_CLIENT_CERT", True))
-    ca_file = resolve_ca_file_path(required=require_client_cert)
-    if require_client_cert:
-        context.load_verify_locations(cafile=ca_file)
-        context.verify_mode = ssl.CERT_REQUIRED
-    elif ca_file:
-        context.load_verify_locations(cafile=ca_file)
-        context.verify_mode = ssl.CERT_OPTIONAL
-    else:
-        context.verify_mode = ssl.CERT_NONE
-    return context
+    return master_build_master_ssl_context()
 
 
 def normalize_master_base_url(value):
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "://" not in raw:
-        raw = f"https://{raw}"
-    parsed = urlsplit(raw)
-    scheme = str(parsed.scheme or "").strip().lower()
-    if scheme != "https":
-        raise ValueError("PORTHOUND_MASTER must use https://")
-    netloc = str(parsed.netloc or "").strip()
-    if not netloc:
-        raise ValueError("PORTHOUND_MASTER host is missing")
-    base_path = str(parsed.path or "").rstrip("/")
-    return f"https://{netloc}{base_path}"
+    from agent import normalize_master_base_url as agent_normalize_master_base_url
+
+    return agent_normalize_master_base_url(value)
 
 
-def build_agent_ssl_context():
-    ca_file = resolve_ca_file_path(required=True)
+def build_agent_ssl_context(allow_missing_client_cert=False, skip_client_cert=False):
+    from agent import build_agent_ssl_context as agent_build_agent_ssl_context
 
-    cert_file = str(getattr(settings, "AGENT_CERT_FILE", "") or "").strip()
-    key_file = str(getattr(settings, "AGENT_KEY_FILE", "") or "").strip()
-    if not cert_file or not key_file:
-        raise RuntimeError("PORTHOUND_AGENT_CERT and PORTHOUND_AGENT_KEY are required in agent mode")
-    if not Path(cert_file).is_file():
-        raise RuntimeError(f"Agent cert file not found: {cert_file}")
-    if not Path(key_file).is_file():
-        raise RuntimeError(f"Agent key file not found: {key_file}")
-
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.check_hostname = bool(getattr(settings, "AGENT_TLS_CHECK_HOSTNAME", True))
-    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
-    return context
+    return agent_build_agent_ssl_context(
+        allow_missing_client_cert=allow_missing_client_cert,
+        skip_client_cert=skip_client_cert,
+    )
 
 
 def post_json_over_tls(url, payload, ssl_context, timeout_seconds):
-    parsed = urlsplit(str(url))
-    if parsed.scheme.lower() != "https":
-        raise RuntimeError("Only https:// URLs are supported")
-    host = str(parsed.hostname or "").strip()
-    if not host:
-        raise RuntimeError("Invalid URL host")
-    port = int(parsed.port or 443)
-    path = parsed.path or "/"
-    if parsed.query:
-        path += f"?{parsed.query}"
+    from agent import post_json_over_tls as agent_post_json_over_tls
 
-    body = json.dumps(payload).encode("utf-8")
-    host_header = host if port == 443 else f"{host}:{port}"
-    request_blob = (
-        f"POST {path} HTTP/1.1\r\n"
-        f"Host: {host_header}\r\n"
-        "Content-Type: application/json\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode("ascii", errors="ignore") + body
-
-    raw_sock = None
-    tls_sock = None
-    response_blob = b""
-    try:
-        raw_sock = socket.create_connection((host, port), timeout=float(timeout_seconds))
-        tls_sock = ssl_context.wrap_socket(raw_sock, server_hostname=host)
-        raw_sock = None
-        tls_sock.settimeout(float(timeout_seconds))
-        tls_sock.sendall(request_blob)
-        while True:
-            chunk = tls_sock.recv(4096)
-            if not chunk:
-                break
-            response_blob += chunk
-    except Exception as exc:
-        raise RuntimeError(str(exc))
-    finally:
-        try:
-            if tls_sock:
-                tls_sock.close()
-        except Exception:
-            pass
-        try:
-            if raw_sock:
-                raw_sock.close()
-        except Exception:
-            pass
-
-    header_blob, separator, body_blob = response_blob.partition(b"\r\n\r\n")
-    if not separator:
-        raise RuntimeError("Invalid HTTP response")
-    lines = header_blob.decode("iso-8859-1", errors="ignore").split("\r\n")
-    if not lines:
-        raise RuntimeError("Invalid HTTP response")
-    status_parts = lines[0].split(" ", 2)
-    if len(status_parts) < 2:
-        raise RuntimeError("Invalid HTTP status line")
-    try:
-        status_code = int(status_parts[1])
-    except Exception:
-        status_code = 0
-
-    headers = {}
-    for line in lines[1:]:
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        headers[key.strip().lower()] = value.strip()
-    if "content-length" in headers:
-        try:
-            expected = int(headers.get("content-length", "0") or "0")
-            if expected >= 0:
-                body_blob = body_blob[:expected]
-        except Exception:
-            pass
-
-    if status_code >= 400:
-        message = body_blob.decode("utf-8", errors="ignore").strip() or f"HTTP {status_code}"
-        raise RuntimeError(f"HTTP {status_code}: {message}")
-
-    if not body_blob:
-        return {}
-    try:
-        return json.loads(body_blob.decode("utf-8", errors="ignore"))
-    except Exception:
-        return {}
-
-
-def _target_proto_set(proto_value):
-    proto = str(proto_value or "").strip().lower()
-    if proto == "sctp":
-        return {"sctp", "stcp"}
-    return {proto}
-
-
-class AgentRuntime:
-    def __init__(self, db):
-        self.db = db
-        self.master_base_url = normalize_master_base_url(
-            getattr(settings, "PORTHOUND_MASTER", "")
-        )
-        if not self.master_base_url:
-            raise RuntimeError("PORTHOUND_MASTER is required in agent mode")
-        master_host = str(urlsplit(self.master_base_url).hostname or "").strip().lower()
-        if master_host in {"127.0.0.1", "localhost", "::1"}:
-            print(
-                "[agent] warning: PORTHOUND_MASTER uses loopback "
-                f"({master_host}); this only works when master and agent run on the same host"
-            )
-        self.ssl_context = build_agent_ssl_context()
-        self.poll_seconds = int(getattr(settings, "AGENT_POLL_SECONDS", 8) or 8)
-        self.http_timeout = float(getattr(settings, "AGENT_HTTP_TIMEOUT", 20.0) or 20.0)
-        configured_agent_id = str(getattr(settings, "AGENT_ID", "") or "").strip()
-        if configured_agent_id:
-            self.agent_id = configured_agent_id
-        else:
-            hostname = socket.gethostname() or "agent"
-            self.agent_id = f"{hostname}-{uuid.uuid4().hex[:10]}"
-        self.registered = False
-        self.failure_streak = 0
-        self.waiting_master = False
-
-    def _endpoint(self, path):
-        return f"{self.master_base_url.rstrip('/')}/{str(path).lstrip('/')}"
-
-    def _post(self, path, payload):
-        response = post_json_over_tls(
-            url=self._endpoint(path),
-            payload=payload,
-            ssl_context=self.ssl_context,
-            timeout_seconds=self.http_timeout,
-        )
-        self._mark_master_reachable()
-        return response
-
-    def _mark_master_reachable(self):
-        if self.waiting_master:
-            print("[agent] master connection restored")
-        self.waiting_master = False
-        self.failure_streak = 0
-
-    def _is_transient_master_error(self, exc):
-        message = str(exc or "").strip().lower()
-        if not message:
-            return False
-        if message.startswith("http 5"):
-            return True
-        markers = (
-            "connection refused",
-            "timed out",
-            "timeout",
-            "temporary failure",
-            "temporarily unavailable",
-            "name or service not known",
-            "network is unreachable",
-            "no route to host",
-            "connection reset by peer",
-            "eof occurred in violation of protocol",
-        )
-        return any(marker in message for marker in markers)
-
-    def _next_retry_delay(self):
-        base = max(2, int(self.poll_seconds))
-        exponent = min(max(self.failure_streak - 1, 0), 5)
-        return min(60, base * (2 ** exponent))
-
-    def register(self):
-        response = self._post(
-            "/api/cluster/agent/register",
-            {"agent_id": self.agent_id},
-        )
-        if str(response.get("status", "")).strip().lower() != "ok":
-            raise RuntimeError(f"Agent register failed: {response}")
-        self.registered = True
-        return response
-
-    def pull_task(self):
-        response = self._post(
-            "/api/cluster/agent/task/pull",
-            {"agent_id": self.agent_id},
-        )
-        status = str(response.get("status", "")).strip().lower()
-        if status == "ok":
-            return response.get("task")
-        if status == "empty":
-            return None
-        raise RuntimeError(f"Agent pull task failed: {response}")
-
-    def submit_task(self, payload):
-        response = self._post("/api/cluster/agent/task/submit", payload)
-        if str(response.get("status", "")).strip().lower() != "ok":
-            raise RuntimeError(f"Agent submit failed: {response}")
-        return response
-
-    def _find_target_row(self, target_item):
-        target_proto = str(target_item.get("proto", "")).strip().lower()
-        target_proto_set = _target_proto_set(target_proto)
-        for row in self.db.select_targets():
-            proto_value = str((row or {}).get("proto", "")).strip().lower()
-            if proto_value not in target_proto_set:
-                continue
-            if str((row or {}).get("network", "")) != str(target_item.get("network", "")):
-                continue
-            if str((row or {}).get("type", "")) != str(target_item.get("type", "")):
-                continue
-            if str((row or {}).get("port_mode", "")) != str(target_item.get("port_mode", "")):
-                continue
-            if int((row or {}).get("port_start", 0) or 0) != int(target_item.get("port_start", 0) or 0):
-                continue
-            if int((row or {}).get("port_end", 0) or 0) != int(target_item.get("port_end", 0) or 0):
-                continue
-            try:
-                if float((row or {}).get("timesleep", 1.0) or 1.0) != float(
-                    target_item.get("timesleep", 1.0) or 1.0
-                ):
-                    continue
-            except Exception:
-                continue
-            return row
-        return None
-
-    def ensure_local_target(self, target_payload):
-        target_candidate = normalize_target_item(
-            {
-                "network": target_payload.get("network"),
-                "type": target_payload.get("type"),
-                "proto": target_payload.get("proto"),
-                "timesleep": target_payload.get("timesleep", 1.0),
-                "status": "active",
-                "port_mode": target_payload.get("port_mode", "preset"),
-                "port_start": target_payload.get("port_start", 0),
-                "port_end": target_payload.get("port_end", 0),
-            }
-        )
-        self.db.insert_targets(data=target_candidate)
-        row = self._find_target_row(target_candidate)
-        if not row:
-            raise RuntimeError("Agent failed to materialize local target")
-
-        target_id = int(row["id"])
-        self.db.clear_target_artifacts(data={"id": target_id})
-        self.db.set_target_progress(data={"id": target_id, "progress": 0.0})
-        self.db.set_target_status(data={"id": target_id, "status": "active"})
-        return target_id, target_candidate
-
-    def wait_target_completion(self, target_id, timeout_seconds=86400):
-        started_at = time.time()
-        last_progress = 0.0
-        last_status = "active"
-        while True:
-            row = self.db.select_target_by_id(target_id)
-            if not row:
-                return 0.0, "stopped"
-            try:
-                last_progress = float(row.get("progress", 0.0) or 0.0)
-            except Exception:
-                last_progress = 0.0
-            last_status = str(row.get("status", "active") or "active").strip().lower()
-            if last_progress >= 100.0:
-                return 100.0, "active"
-            if last_status == "stopped":
-                return last_progress, "stopped"
-            if time.time() - started_at > float(timeout_seconds):
-                raise TimeoutError("scan timeout waiting for target completion")
-            time.sleep(1.0)
-
-    def collect_result_payload(self, target_payload):
-        network = ip_network(str(target_payload.get("network", "")).strip(), strict=False)
-        proto_set = _target_proto_set(target_payload.get("proto"))
-
-        def in_target(ip_value):
-            try:
-                return ip_address(str(ip_value)) in network
-            except Exception:
-                return False
-
-        ports = []
-        for row in self.db.select_ports():
-            proto_value = str((row or {}).get("proto", "")).strip().lower()
-            if proto_value not in proto_set:
-                continue
-            ip_value = str((row or {}).get("ip", "")).strip()
-            if not in_target(ip_value):
-                continue
-            ports.append(
-                {
-                    "ip": ip_value,
-                    "port": int((row or {}).get("port", 0) or 0),
-                    "proto": proto_value,
-                    "state": str((row or {}).get("state", "open")).strip().lower(),
-                }
-            )
-
-        tags = []
-        for row in self.db.select_tags():
-            proto_value = str((row or {}).get("proto", "")).strip().lower()
-            if proto_value not in proto_set:
-                continue
-            ip_value = str((row or {}).get("ip", "")).strip()
-            if not in_target(ip_value):
-                continue
-            tags.append(
-                {
-                    "ip": ip_value,
-                    "port": int((row or {}).get("port", 0) or 0),
-                    "proto": proto_value,
-                    "key": str((row or {}).get("key", ""))[:120],
-                    "value": str((row or {}).get("value", ""))[:4096],
-                }
-            )
-
-        banners = []
-        for row in self.db.select_banners():
-            proto_value = str((row or {}).get("proto", "")).strip().lower()
-            if proto_value not in proto_set:
-                continue
-            ip_value = str((row or {}).get("ip", "")).strip()
-            if not in_target(ip_value):
-                continue
-            banners.append(
-                {
-                    "ip": ip_value,
-                    "port": int((row or {}).get("port", 0) or 0),
-                    "proto": proto_value,
-                    "response_plain": str((row or {}).get("response_plain", ""))[:8192],
-                }
-            )
-
-        favicons = []
-        for row in self.db.select_favicons():
-            proto_value = str((row or {}).get("proto", "")).strip().lower()
-            if proto_value not in proto_set:
-                continue
-            ip_value = str((row or {}).get("ip", "")).strip()
-            if not in_target(ip_value):
-                continue
-            raw = self.db.get_favicon_by_id(int((row or {}).get("id", 0) or 0))
-            if not raw:
-                continue
-            icon_blob = bytes(raw.get("icon_blob") or b"")
-            if not icon_blob:
-                continue
-            favicons.append(
-                {
-                    "ip": str(raw.get("ip", "")).strip(),
-                    "port": int(raw.get("port", 0) or 0),
-                    "proto": str(raw.get("proto", "tcp")).strip().lower() or "tcp",
-                    "icon_url": str(raw.get("icon_url", "/favicon.ico")).strip() or "/favicon.ico",
-                    "mime_type": str(raw.get("mime_type", "application/octet-stream")).strip()
-                    or "application/octet-stream",
-                    "size": int(raw.get("size", len(icon_blob)) or len(icon_blob)),
-                    "sha256": str(raw.get("sha256", "")).strip(),
-                    "icon_blob_b64": base64.b64encode(icon_blob).decode("ascii"),
-                }
-            )
-
-        return {
-            "ports": ports,
-            "tags": tags,
-            "banners": banners,
-            "favicons": favicons,
-        }
-
-    def cleanup_local_target(self, target_id):
-        try:
-            self.db.clear_target_artifacts(data={"id": int(target_id)})
-        except Exception:
-            pass
-        try:
-            self.db.delete_target(data={"id": int(target_id)})
-        except Exception:
-            pass
-
-    def execute_task(self, task):
-        if not isinstance(task, dict):
-            return
-        target_payload = task.get("target") or {}
-        task_id = str(task.get("task_id", "")).strip()
-        if not isinstance(target_payload, dict) or not task_id:
-            return
-
-        try:
-            master_target_id = int(target_payload.get("master_target_id"))
-        except Exception:
-            raise RuntimeError("Invalid task payload: missing master_target_id")
-        local_target_id = None
-        started_at = utc_iso(int(time.time()))
-        progress = 0.0
-        status = "stopped"
-        error = ""
-        result = {"ports": [], "tags": [], "banners": [], "favicons": []}
-        try:
-            local_target_id, normalized_target = self.ensure_local_target(target_payload)
-            progress, status = self.wait_target_completion(local_target_id)
-            result = self.collect_result_payload(normalized_target)
-            status = "active" if progress >= 100.0 else status
-        except Exception as exc:
-            error = str(exc)
-        finally:
-            if local_target_id:
-                self.cleanup_local_target(local_target_id)
-
-        result["progress"] = progress
-        result["status"] = status
-        if error:
-            result["error"] = error
-        submission = {
-            "agent_id": self.agent_id,
-            "task_id": task_id,
-            "master_target_id": master_target_id,
-            "started_at": started_at,
-            "finished_at": utc_iso(int(time.time())),
-            "result": result,
-        }
-        self.submit_task(submission)
-
-    def run_forever(self):
-        print(f"[agent] starting agent_id={self.agent_id} master={self.master_base_url}")
-        while True:
-            try:
-                if not self.registered:
-                    self.register()
-                    print("[agent] registration successful")
-                task = self.pull_task()
-                if not task:
-                    time.sleep(self.poll_seconds)
-                    continue
-                self.execute_task(task)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                self.registered = False
-                if self._is_transient_master_error(exc):
-                    self.failure_streak += 1
-                    retry_in = self._next_retry_delay()
-                    if not self.waiting_master:
-                        self.waiting_master = True
-                        print(f"[agent] master unreachable: {exc}")
-                    elif self.failure_streak % 5 == 0:
-                        print(
-                            "[agent] still waiting for master "
-                            f"(attempt {self.failure_streak}, retry in {retry_in}s): {exc}"
-                        )
-                    time.sleep(retry_in)
-                    continue
-
-                self.failure_streak = 0
-                self.waiting_master = False
-                print(f"[agent] loop error: {exc}")
-                time.sleep(self.poll_seconds)
+    return agent_post_json_over_tls(
+        url=url,
+        payload=payload,
+        ssl_context=ssl_context,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def run_master_mode(enable_local_scanners=False):
-    ssl_context = build_master_ssl_context()
-    app.add_startup(register_frontend_dist_routes)
-    app.add_startup(start_geoip_blocks_db)
-    if enable_local_scanners:
-        app.add_startup(start_scanners)
-    app.add_startup(start_scan_map_telemetry)
-    app.add_startup(start_attack_telemetry)
-    role_label = "standalone" if enable_local_scanners else "master"
-    if not str(getattr(settings, "API_TOKEN", "") or "").strip():
-        bind_host = str(getattr(settings, "HOST", "") or "").strip().lower()
-        if bind_host not in {"127.0.0.1", "localhost", "::1"}:
-            print(
-                "[security] PORTHOUND_API_TOKEN is not set. "
-                "Admin endpoints are restricted to loopback clients."
-            )
-    print(f"[bootstrap] role={role_label} host={settings.HOST} port={settings.PORT}")
-    app.run(settings.HOST, settings.PORT, ssl_context=ssl_context)
+    from master import run_master_mode as master_run_master_mode
+
+    return master_run_master_mode(enable_local_scanners=enable_local_scanners)
 
 
 def run_agent_mode():
-    start_geoip_blocks_db()
-    start_scanners()
-    runtime = AgentRuntime(scan_db)
-    runtime.run_forever()
+    from agent import run_agent_mode as agent_run_agent_mode
+
+    return agent_run_agent_mode(db=scan_db)
 
 
 def main():

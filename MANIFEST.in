@@ -1,0 +1,15 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CITATION.cff
+include API.md
+include ARCHITECTURE.md
+include DEPLOYMENT.md
+include GETTING_STARTED.md
+include INSTALL.md
+include ROADMAP.md
+include SECURITY.md
+include SUPPORT.md
+recursive-include data *
+recursive-include docs *
+recursive-include frontend/dist *

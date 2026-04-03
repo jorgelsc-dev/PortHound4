@@ -1,0 +1,100 @@
+name: Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  python-dist:
+    name: Python sdist/wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  pyinstaller:
+    name: PyInstaller (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build binary
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          pyinstaller --onefile --name porthound manage.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: porthound-${{ matrix.os }}
+          path: dist/*
+
+  source-archive:
+    name: Source archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create archives
+        run: |
+          git archive --format=zip -o porthound-source.zip HEAD
+          git archive --format=tar.gz -o porthound-source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-archive
+          path: |
+            porthound-source.zip
+            porthound-source.tar.gz
+
+  docker-image:
+    name: Docker image (tar)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build -t porthound:local .
+          docker save porthound:local -o porthound-docker.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: porthound-docker.tar
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm install
+        working-directory: frontend
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist

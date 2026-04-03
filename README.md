@@ -6,6 +6,14 @@ PortHound4 is a professional cybersecurity tool for network scanning, service de
 
 ---
 
+## 📘 Documentacion
+
+- `README.md` -> guia principal del proyecto.
+- `FAST.md` -> guia corta, directa y simple para arrancar rapido.
+- `docs/` -> notas tecnicas adicionales.
+
+---
+
 ## ✨ Caracteristicas
 
 - Escaneo TCP/UDP concurrente.
@@ -17,14 +25,15 @@ PortHound4 is a professional cybersecurity tool for network scanning, service de
 
 ---
 
-## 🚀 Inicio rapido (Cluster Seguro)
+## 🚀 Inicio rapido (flujo que funciona local)
 
-> Flujo recomendado: 1 master + N agentes, todos con TLS/mTLS y CA propia.
+> Flujo recomendado: levantar `master` en HTTP interno y conectar agentes con `agent_id + token`.
+
+Si quieres la version corta, abre `FAST.md`.
 
 ### 0) Prerequisitos
 
 - Python 3.11+.
-- `cryptography` (se instala en el paso de `env`).
 - Puertos abiertos entre nodos (por defecto `45678/tcp`).
 
 ### 1) Crear entorno virtual `env` (una sola vez)
@@ -32,7 +41,6 @@ PortHound4 is a professional cybersecurity tool for network scanning, service de
 ```bash
 python3 -m venv env
 env/bin/python -m pip install --upgrade pip
-env/bin/python -m pip install cryptography
 ```
 
 Opcional (si prefieres activar el entorno):
@@ -41,109 +49,115 @@ Opcional (si prefieres activar el entorno):
 source env/bin/activate
 ```
 
-### 2) Generar PKI local (CA + certs)
+### 2) Paso a paso: Master (nodo principal)
+
+1. Arranque master (interactivo):
 
 ```bash
-export MASTER_IP=127.0.0.1
-env/bin/python scripts/generate_certs.py \
-  --out-dir certs \
-  --master-host localhost \
-  --master-ip "${MASTER_IP}" \
-  --overwrite
+env/bin/python manage.py
 ```
 
-Genera:
-- `certs/ca/ca.cert.pem`
-- `certs/master/master.cert.pem` + `certs/master/master.key.pem`
-- `certs/admin/admin.cert.pem` + `certs/admin/admin.key.pem`
-- `certs/agent/agent.cert.pem` + `certs/agent/agent.key.pem`
-- `certs/master.env`, `certs/agent.env`, `certs/admin.env`
-- Variable lista para terminal: `PORTHOUND_CA_ONELINE='-----BEGIN...\\n...\\n-----END...'`
+Entrada directa equivalente:
 
-### 3) Paso a paso: Master (nodo principal)
+```bash
+env/bin/python master.py
+```
 
-1. Inicia el master (modo explicito por argumentos):
+Al ejecutar `python manage.py`, se asume `master` y te pedira:
+- `IP`: `0.0.0.0`
+- `Port`: `45678`
+- (TLS queda desactivado por politica)
+
+2. Arranque por argumentos (equivalente):
 
 ```bash
 env/bin/python manage.py \
   --role master \
   --host 0.0.0.0 \
   --port 45678 \
-  --ca certs/ca/ca.cert.pem \
-  --tls-cert-file certs/master/master.cert.pem \
-  --tls-key-file certs/master/master.key.pem
+  --db-path Master.db
 ```
 
-2. Alternativa rapida (sin argumentos): `manage.py` carga `certs/master.env` automaticamente.
+3. Arranque rapido sin argumentos:
 
 ```bash
 env/bin/python manage.py
 ```
 
-3. Verifica que el master responda:
-- UI/API TLS: `https://<MASTER_HOST>:45678`
-- Vista de agentes: `https://<MASTER_HOST>:45678/cluster/agents/`
+`manage.py` abre wizard en terminal (uno por uno) y usa la DB del rol (`Master.db`) como valores por defecto.
 
-### 4) Paso a paso: Agente (repetir por cada agente)
+4. Verifica que el master responda:
+- UI/API: `http://localhost:45678` o `http://127.0.0.1:45678`
+- No uses `http://0.0.0.0:45678` en el navegador.
+- Vista de agentes: `http://localhost:45678/cluster/agents/`
 
-1. En cada agente, asegurate de tener estos archivos:
-- `certs/ca/ca.cert.pem`
-- `certs/agent/agent.cert.pem`
-- `certs/agent/agent.key.pem`
-- opcional: `certs/agent.env`
+5. Si ya guardaste valores incorrectos en DB:
+- Vuelve a ejecutar con argumentos explicitos (sobrescribe y guarda de nuevo).
+- O ejecuta `env/bin/python manage.py --interactive` y corrige los campos.
 
-2. Inicia un agente por argumentos (recomendado para remoto):
+### 3) Paso a paso: Agente (repetir por cada agente)
+
+1. En el master abre la web: `http://localhost:45678/cluster/agents/`
+- Pulsa `Agregar agente`.
+- Copia `agent_id` + `token` del bloque generado.
+- Copia el `ENROLL BASE64` (contiene JSON con todo lo necesario).
+- Copia `COMANDO RAPIDO (copiar/pegar en el agente)`.
+- Ese bloque ya trae exactamente lo que debes responder en el wizard del agente.
+
+2. En el agente:
+
+```bash
+env/bin/python manage.py agent
+```
+
+Entrada directa equivalente:
+
+```bash
+env/bin/python agent.py
+```
+
+Al ejecutar `python manage.py agent`, te pedira:
+- `Enroll base64 (opcional)`: pega el base64 del master para autocompletar todo.
+- `agent_id`: `<agent_id generado en la web>`
+- `token`: `<token generado en la web>`
+- `master_ip`: `<IP del master>`
+- `master_host`: `<host del master>`
+
+3. Enroll directo (recomendado si ya tienes base64):
+
+```bash
+env/bin/python manage.py agent --enroll '<BASE64_DEL_MASTER>'
+```
+
+4. Inicia un agente por argumentos (opcional para remoto):
 
 ```bash
 env/bin/python manage.py \
   --role agent \
-  --master https://<MASTER_HOST>:45678 \
-  --ca certs/ca/ca.cert.pem \
-  --agent-cert certs/agent/agent.cert.pem \
-  --agent-key certs/agent/agent.key.pem \
+  --master http://<MASTER_HOST>:45678 \
+  --agent-id <agent_id_generado_en_web> \
+  --agent-token <token_generado_en_web> \
   --ip <IP_DE_SALIDA_DEL_AGENTE>
 ```
 
-3. Alternativa rapida por env (sin argumentos): `manage.py` carga `certs/agent.env` automaticamente.
-
-```bash
-source certs/agent.env
-export PORTHOUND_MASTER=https://<MASTER_HOST>:45678
-export PORTHOUND_IP=<IP_DE_SALIDA_DEL_AGENTE>
-env/bin/python manage.py
-```
-
-4. Opcion remota sin archivo CA (inline):
+5. Alternativa rapida por env (sin argumentos):
 
 ```bash
 export PORTHOUND_ROLE=agent
-export PORTHOUND_MASTER=https://<MASTER_HOST>:45678
-export PORTHOUND_CA_ONELINE='-----BEGIN CERTIFICATE-----\n...'
-export PORTHOUND_AGENT_CERT=/ruta/agent.cert.pem
-export PORTHOUND_AGENT_KEY=/ruta/agent.key.pem
+export PORTHOUND_MASTER=http://<MASTER_HOST>:45678
+export PORTHOUND_AGENT_ID=<agent_id_generado_en_web>
+export PORTHOUND_AGENT_TOKEN=<token_generado_en_web>
 export PORTHOUND_IP=<IP_DE_SALIDA_DEL_AGENTE>
 env/bin/python manage.py
 ```
 
-Obtener CA one-line desde el master:
+### 4) Verificacion final (master + agentes)
 
-```bash
-curl -k \
-  --cert certs/admin/admin.cert.pem \
-  --key certs/admin/admin.key.pem \
-  https://<MASTER_HOST>:45678/api/cluster/ca/oneline
-```
-
-### 5) Verificacion final (master + agentes)
-
-- Abre `https://<MASTER_HOST>:45678/cluster/agents/` y confirma `online`.
+- Abre `http://<MASTER_HOST>:45678/cluster/agents/` y confirma `online`.
 - Consulta API de agentes:
 
 ```bash
-curl -k \
-  --cert certs/admin/admin.cert.pem \
-  --key certs/admin/admin.key.pem \
-  https://<MASTER_HOST>:45678/api/cluster/agents
+curl http://<MASTER_HOST>:45678/api/cluster/agents
 ```
 
 ### Ejecucion legacy (sin cluster)
@@ -153,17 +167,42 @@ env/bin/python server.py   # API de escaneo
 env/bin/python ws_demo.py  # Demo HTTP/WS
 ```
 
+### Resumen ultra corto
+
+1. Inicia el master con `env/bin/python master.py` o `env/bin/python manage.py`.
+2. Abre `http://localhost:45678/cluster/agents/`.
+3. Crea una credencial de agente y copia `agent_id` + `token`.
+4. En el agente ejecuta `env/bin/python agent.py` o `env/bin/python manage.py agent`.
+5. Verifica en la vista de agentes que el estado aparezca como `online`.
+
+### Problemas comunes de conectividad
+
+- `Only http:// URLs are supported`:
+  - El agente se configuro con `https://`.
+  - Solucion: usa `http://<master>:45678`.
+
+- `Invalid agent_id or token`:
+  - `agent_id` o `token` no coincide con la credencial activa en el master.
+  - Solucion: regenera la credencial desde `/cluster/agents/` y vuelve a cargarla en el agente.
+
+- `El agente parece bloqueado al ejecutar una task`:
+  - Un escaneo `full` (1-65534) puede tardar mucho tiempo segun `timesleep` y timeouts de red.
+  - El agente ahora imprime progreso periodico en consola: `[agent] task progress ...`.
+  - Puedes ajustar deteccion de estancamiento con `PORTHOUND_AGENT_TASK_STALL_SECONDS` (minimo 90, por defecto 300).
+
 ---
 
 ## 🧩 Estructura del proyecto
 
 - `app.py` -> app principal con rutas `plain/api/ws`.
+- `master.py` -> arranque dedicado del rol master/standalone.
+- `agent.py` -> runtime dedicado del rol agent y loop de ejecucion remota.
 - `framework.py` -> micro framework interno (router, request/response, WS).
 - `server.py` -> motor de escaneo TCP/UDP + banners + SQLite.
 - `ws_demo.py` -> servidor HTTP/WS con ORM ligero y UI demo.
 - `settings.py` -> configuracion del servidor.
 - `frontend/` -> frontend Vue 3.
-- `scripts/generate_certs.py` -> PKI local (CA + certs mTLS).
+- `scripts/generate_certs.py` -> utilitario legacy de certificados (no requerido en el flujo actual).
 
 ---
 
@@ -186,13 +225,13 @@ API WS demo:
 - `POST /api/chat/clear`
 
 WebSocket:
-- `wss://HOST:PORT/ws/`
+- `ws://HOST:PORT/ws/`
 
 Cluster master/agent:
 - `GET /api/cluster/agents`
-- `GET /api/cluster/ca`
-- `GET /api/cluster/ca/raw`
-- `GET /api/cluster/ca/oneline`
+- `GET /api/cluster/agent/credentials`
+- `POST /api/cluster/agent/credentials`
+- `DELETE /api/cluster/agent/credentials`
 - `POST /api/cluster/agent/register`
 - `POST /api/cluster/agent/task/pull`
 - `POST /api/cluster/agent/task/submit`
@@ -206,6 +245,8 @@ cd frontend
 npm install
 npm run serve
 ```
+
+El frontend es opcional. El backend master funciona sin compilar `frontend/`.
 
 ---
 
