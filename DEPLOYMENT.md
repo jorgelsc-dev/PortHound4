@@ -50,6 +50,39 @@ docker push ${IMAGE}:production
 docker push ${IMAGE}:main
 ```
 
+## GitHub Release automatico (por tag)
+- Workflow: `.github/workflows/package.yml`
+- Trigger: push de tag con prefijo `v` (ejemplo: `v1.2.0`)
+- Resultado: compila artefactos y crea un GitHub Release con assets adjuntos.
+
+### Comandos para release estable (main)
+```bash
+git checkout main
+git pull origin main
+
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+### Comandos para pre-release (production/develop)
+```bash
+# ejemplo RC desde production
+git checkout production
+git pull origin production
+
+git tag v1.2.0-rc1
+git push origin v1.2.0-rc1
+```
+
+```bash
+# ejemplo beta desde develop
+git checkout develop
+git pull origin develop
+
+git tag v1.2.0-beta1
+git push origin v1.2.0-beta1
+```
+
 ## Systemd (Linux)
 Create a service file at `/etc/systemd/system/porthound.service`:
 
