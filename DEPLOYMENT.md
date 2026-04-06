@@ -7,12 +7,11 @@ python manage.py
 
 ## Docker image by branch (GitHub Actions)
 - Workflow: `.github/workflows/docker-branches.yml`
-- Trigger: push to `develop`, `production`, or `main`
+- Trigger: push to `develop` or `production`
 - Image registry: `ghcr.io`
 - Generated tags:
   - `develop` branch -> `ghcr.io/<owner>/porthound4:develop`
   - `production` branch -> `ghcr.io/<owner>/porthound4:production`
-  - `main` branch -> `ghcr.io/<owner>/porthound4:main`
 
 ### Commands to trigger from git
 ```bash
@@ -23,10 +22,6 @@ git push origin develop
 # production
 git checkout production
 git push origin production
-
-# main
-git checkout main
-git push origin main
 ```
 
 ### Equivalent local Docker commands
@@ -35,7 +30,6 @@ IMAGE=ghcr.io/<owner>/porthound4
 
 docker build -t ${IMAGE}:develop .
 docker build -t ${IMAGE}:production .
-docker build -t ${IMAGE}:main .
 ```
 
 ### Push manually to GHCR (optional)
@@ -47,40 +41,28 @@ echo "<GHCR_TOKEN>" | docker login ghcr.io -u "<owner>" --password-stdin
 
 docker push ${IMAGE}:develop
 docker push ${IMAGE}:production
-docker push ${IMAGE}:main
 ```
 
-## GitHub Release automatico (por tag)
+## GitHub Release automatico (main)
 - Workflow: `.github/workflows/package.yml`
-- Trigger: push de tag con prefijo `v` (ejemplo: `v1.2.0`)
+- Trigger: push a `main` (o tag con prefijo `v`)
 - Resultado: compila artefactos y crea un GitHub Release con assets adjuntos.
+- En `main` se genera un tag automatico con formato `main-<run>.<attempt>-<sha7>`.
 
-### Comandos para release estable (main)
+### Comandos para release estable (main, automatico)
 ```bash
 git checkout main
 git pull origin main
+git push origin main
+```
 
+### Comandos opcionales para release por version (tag)
+```bash
+# ejemplo release versionada
+git checkout main
+git pull origin main
 git tag v1.2.0
 git push origin v1.2.0
-```
-
-### Comandos para pre-release (production/develop)
-```bash
-# ejemplo RC desde production
-git checkout production
-git pull origin production
-
-git tag v1.2.0-rc1
-git push origin v1.2.0-rc1
-```
-
-```bash
-# ejemplo beta desde develop
-git checkout develop
-git pull origin develop
-
-git tag v1.2.0-beta1
-git push origin v1.2.0-beta1
 ```
 
 ## Systemd (Linux)
