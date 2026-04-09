@@ -1,14 +1,34 @@
 # Security Policy
 
-## Reporting a Vulnerability
-Please report security issues privately.
+## Reporting a vulnerability
 
-Suggested process:
-1. Open a private report by contacting the maintainers.
-2. Include a detailed description, impact, and steps to reproduce.
-3. If possible, include a proof of concept.
+Do not open public issues for security findings.
 
-We will acknowledge receipt, assess the issue, and coordinate a fix.
+Preferred channel:
+1. Go to `Security -> Advisories -> Report a vulnerability` in this repository.
+2. Provide impact, affected versions/commit, and reproduction steps.
+3. Include proof of concept and suggested mitigation when possible.
 
-## Supported Versions
-Only the latest release is supported for security fixes.
+Direct link:
+- https://github.com/jorgelsc-dev/PortHound4/security/advisories/new
+
+## Response targets
+
+- Initial acknowledgment: within 72 hours.
+- Triage and severity classification: as soon as reproduction is confirmed.
+- Fix coordination: private until a patch is available.
+
+## Disclosure expectations
+
+- Use coordinated disclosure.
+- Do not publish exploit details before maintainers release a fix.
+- Test only on systems you own or have explicit written authorization to assess.
+
+## Supported versions
+
+Only actively maintained branches/releases receive security fixes:
+
+- `develop` (active development)
+- `main` (stable release line)
+
+Older snapshots and experimental branches may not receive patches.

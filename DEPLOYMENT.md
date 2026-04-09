@@ -5,6 +5,8 @@
 python manage.py
 ```
 
+For a quick GHCR-based `master + agent` deployment, see `FAST_DOCKER.md`.
+
 ## Docker image by branch (GitHub Actions)
 - Workflow: `.github/workflows/docker-branches.yml`
 - Trigger: push to `develop` or `production`
@@ -97,5 +99,9 @@ sudo systemctl start porthound
 Place Nginx or Caddy in front if you need TLS, auth, or rate limits.
 
 ## Notes
-- Ensure the process has write access to `Database.db`.
+- Ensure the process has write access to the role DB path (`PORTHOUND_DB_PATH`).
+- Default role DB names:
+  - `master` -> `Master.db`
+  - `agent` -> `Agent.db`
+  - `standalone` -> `Standalone.db`
 - Keep the service in a trusted environment and with explicit authorization.

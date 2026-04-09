@@ -1,7 +1,9 @@
 # WebSocket
 
 ## Endpoint
-- wss://HOST:PORT/ws/
+- ws://HOST:PORT/ws/
+
+If deployed behind TLS reverse proxy, clients can use `wss://`.
 
 ## Behavior
 - Text messages are echoed back.

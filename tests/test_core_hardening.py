@@ -1112,6 +1112,21 @@ class TestClusterAgentHeartbeatApi(unittest.TestCase):
             db.create_tables()
             credential = db.create_cluster_agent_credential({"agent_id": "agent-heartbeat-unit"})
             agent_id = credential["agent_id"]
+            db.insert_targets(
+                {
+                    "network": "10.55.0.0/24",
+                    "type": "common",
+                    "proto": "tcp",
+                    "port_mode": "preset",
+                    "port_start": 0,
+                    "port_end": 0,
+                    "timesleep": 1.0,
+                    "status": "active",
+                }
+            )
+            targets = db.select_targets()
+            self.assertTrue(targets)
+            target_id = int(targets[0]["id"])
 
             original_db = app.scan_db
             with app.cluster_lock:
@@ -1126,7 +1141,7 @@ class TestClusterAgentHeartbeatApi(unittest.TestCase):
                     "auth_mode": "token",
                     "client": ("127.0.0.1", 1111),
                 }
-                app.cluster_leases[202] = {
+                app.cluster_leases[target_id] = {
                     "task_id": "hb-task",
                     "agent_id": agent_id,
                     "lease_until": time.time() + 5,
@@ -1136,7 +1151,7 @@ class TestClusterAgentHeartbeatApi(unittest.TestCase):
                 app.scan_db = db
                 before_lease_until = 0.0
                 with app.cluster_lock:
-                    before_lease_until = float(app.cluster_leases[202]["lease_until"])
+                    before_lease_until = float(app.cluster_leases[target_id]["lease_until"])
 
                 request = framework.Request(
                     method="POST",
@@ -1148,7 +1163,7 @@ class TestClusterAgentHeartbeatApi(unittest.TestCase):
                             "agent_id": agent_id,
                             "token": credential["agent_key"],
                             "task_id": "hb-task",
-                            "master_target_id": 202,
+                            "master_target_id": target_id,
                             "progress": 12.3,
                             "status": "active",
                         }
@@ -1162,7 +1177,7 @@ class TestClusterAgentHeartbeatApi(unittest.TestCase):
 
                 with app.cluster_lock:
                     updated_agent = app.cluster_agents.get(agent_id, {})
-                    updated_lease = app.cluster_leases.get(202, {})
+                    updated_lease = app.cluster_leases.get(target_id, {})
                 self.assertGreater(float(updated_agent.get("last_seen", 0.0) or 0.0), 1.0)
                 self.assertGreater(
                     float(updated_lease.get("lease_until", 0.0) or 0.0),
