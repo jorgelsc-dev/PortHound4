@@ -46,6 +46,34 @@
               Open Live App
             </v-btn>
           </div>
+          <v-divider class="my-4" />
+          <div class="text-subtitle-2 font-weight-medium">Support PortHound</div>
+          <div class="text-caption text-medium-emphasis">
+            Optional BTC donation for project maintenance.
+          </div>
+          <div class="btc-address mt-3">{{ btcAddress }}</div>
+          <div class="d-flex flex-wrap ga-2 mt-3">
+            <v-btn
+              color="warning"
+              variant="flat"
+              size="small"
+              prepend-icon="mdi-content-copy"
+              @click="copyBtcAddress"
+            >
+              Copy BTC
+            </v-btn>
+            <v-btn
+              color="warning"
+              variant="outlined"
+              size="small"
+              prepend-icon="mdi-currency-btc"
+              :href="btcExplorerLink"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open BTC Link
+            </v-btn>
+          </div>
         </v-card>
       </v-col>
     </v-row>
@@ -66,6 +94,11 @@ export default {
     },
   },
   emits: ["update:api-base-draft", "save-api-base", "reset-api-base"],
+  data() {
+    return {
+      btcAddress: "bc1q3lhxpr9yantvefmvhpd2h4lu0ykf3t45zvuve2",
+    };
+  },
   computed: {
     appLink() {
       const value = String(this.apiBaseLabel || "").trim();
@@ -74,6 +107,18 @@ export default {
     appLinkLabel() {
       const value = String(this.appLink || "").trim();
       return value || "/";
+    },
+    btcExplorerLink() {
+      return `https://mempool.space/address/${this.btcAddress}`;
+    },
+  },
+  methods: {
+    copyBtcAddress() {
+      const value = String(this.btcAddress || "").trim();
+      if (!value) return;
+      if (typeof navigator === "undefined") return;
+      if (!navigator.clipboard || !navigator.clipboard.writeText) return;
+      navigator.clipboard.writeText(value).catch(() => {});
     },
   },
 };
@@ -132,6 +177,17 @@ export default {
   color: rgba(202, 230, 255, 0.96);
   word-break: break-all;
  }
+
+.btc-address {
+  padding: 0.78rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(252, 186, 72, 0.28);
+  background: rgba(46, 31, 12, 0.55);
+  color: rgba(255, 220, 157, 0.98);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
 
 .hero-banner :deep(.v-btn) {
   letter-spacing: 0.04em;

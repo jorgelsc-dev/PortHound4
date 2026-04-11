@@ -1,40 +1,53 @@
 # API Reference
 
-Base URL: `https://HOST:PORT`
+Default base URL: `http://HOST:PORT` (default `http://127.0.0.1:45678`).
 
-If the client requests `Accept: text/html`, `/` returns the demo HTML. Otherwise it returns JSON counts.
+WebSocket endpoint: `ws://HOST:PORT/ws/`.
 
-Demo mode (`?example=1`) is disabled in the current public API build.
+If you deploy behind a reverse proxy with TLS, external clients may use `https://`/`wss://`.
 
-Admin-protected endpoints:
-- Mutating endpoints and cluster/WS control endpoints require admin access.
-- If `PORTHOUND_API_TOKEN` is configured, send it as `Authorization: Bearer <token>` or `X-API-Key: <token>`.
-- Without token, admin operations are only allowed from loopback clients (`127.0.0.1`/`::1`).
+## Admin access model
 
-## Core endpoints
+Admin-protected endpoints use this rule:
 
-### GET /
-Returns counts.
+1. If `PORTHOUND_API_TOKEN` is set: send `Authorization: Bearer <token>` (or `X-API-Key`).
+2. If `PORTHOUND_API_TOKEN` is not set: admin calls are allowed only from loopback (`127.0.0.1` / `::1`).
+3. If `PORTHOUND_API_REQUIRE_TOKEN=1` and no token is configured: admin calls are rejected.
 
-Response:
-```json
-{
-  "count_ports": 0,
-  "count_banners": 0,
-  "count_targets": 0
-}
-```
+## Core read endpoints (non-admin)
 
-### GET /protocols/
-Returns supported target protocols for the current host/runtime.
+- `GET /` -> counts summary (JSON) or HTML when `Accept: text/html`.
+- `GET /protocols/` -> runtime-supported protocols.
+- `GET /targets/`
+- `GET /ports/`
+- `GET /ports/tcp/` | `GET /ports/udp/` | `GET /ports/icmp/` | `GET /ports/sctp/`
+- `GET /tags/`
+- `GET /tags/tcp/` | `GET /tags/udp/` | `GET /tags/icmp/` | `GET /tags/sctp/`
+- `GET /banners/`
+- `GET /favicons/`
+- `GET /favicons/raw/?id=<id>`
+- `GET /count/targets/`
+- `GET /count/ports/`
+- `GET /count/ports/tcp/` | `GET /count/ports/udp/` | `GET /count/ports/icmp/` | `GET /count/ports/sctp/`
+- `GET /count/banners/`
 
-### GET /targets/
-Returns all targets.
+Compatibility aliases also exist for `stcp` on `ports/tags/count` routes.
 
-### POST /target/
-Create target.
+## Core write endpoints (admin)
 
-Body:
+- `POST /target/`
+- `PUT /target/`
+- `DELETE /target/`
+- `POST /target/action/` (`start|restart|stop|delete`)
+- `POST /target/action/bulk/`
+- `POST /port/action/`
+- `POST /banner/action/`
+- `DELETE /ports/tcp/` | `DELETE /ports/udp/` | `DELETE /ports/icmp/` | `DELETE /ports/sctp/`
+- `DELETE /banners/`
+- `DELETE /favicons/`
+
+Create target example:
+
 ```json
 {
   "network": "10.0.0.0/24",
@@ -44,213 +57,73 @@ Body:
 }
 ```
 
-Valid `proto` values: `tcp`, `udp`, `icmp`, and `sctp` when supported.
+## UI/helper endpoints
 
-### PUT /target/
-Update target.
+Non-admin:
+- `GET /api/dashboard/`
+- `GET /api/endpoints/`
 
-### DELETE /target/
-Delete target.
+Catalog endpoints:
+- `GET /api/catalog/banner-rules/`
+- `GET /api/catalog/banner-requests/`
+- `GET /api/catalog/ip-presets/`
+- `POST|PUT|DELETE` on those same routes are admin-protected.
 
-### GET /ports/
-Returns all ports.
+IP intel endpoints (non-admin):
+- `GET /api/ip/domains/?ip=<ipv4>`
+- `GET /api/ip/ttl-path/?ip=<ipv4>`
+- `GET /api/ip/intel/?ip=<ipv4>`
 
-### GET /ports/tcp/
-### GET /ports/udp/
-### GET /ports/icmp/
-### GET /ports/sctp/
-### DELETE /ports/tcp/
-### DELETE /ports/udp/
-### DELETE /ports/icmp/
-### DELETE /ports/sctp/
+## Attack telemetry endpoints
 
-### GET /banners/
-### DELETE /banners/
+Non-admin:
+- `GET /api/attacks/feed?limit=40`
+- `GET /api/attacks/summary`
+- `GET /api/attacks/simulator`
 
-### GET /tags/
-### GET /tags/tcp/
-### GET /tags/udp/
-### GET /tags/icmp/
-### GET /tags/sctp/
+Admin:
+- `POST /api/attacks/simulate`
+- `POST /api/attacks/simulator`
 
-### GET /count/targets/
-### GET /count/ports/
-### GET /count/ports/tcp/
-### GET /count/ports/udp/
-### GET /count/ports/icmp/
-### GET /count/ports/sctp/
-### GET /count/banners/
+## WebSocket control API
 
-## Frontend helper endpoints
+Admin:
+- `GET /api/ws/clients`
+- `POST /api/ws/broadcast`
+- `POST /api/ws/ping`
+- `POST /api/ws/close`
 
-### GET /api/dashboard/
-Returns a single snapshot payload for the UI:
-```json
-{
-  "counts": {"count_ports": 0, "count_banners": 0, "count_targets": 0},
-  "targets": [],
-  "ports": {"tcp": [], "udp": [], "icmp": [], "sctp": []},
-  "banners": [],
-  "tags": [],
-  "ws_clients": []
-}
-```
+Chat:
+- `GET /api/chat/messages` (non-admin)
+- `POST /api/chat/clear` (admin)
 
-### GET /api/endpoints/
-Returns an endpoint catalog for the UI.
+## Cluster endpoints
 
-### GET /attacks/raw/
-Raw HTML dashboard (no framework) that consumes REST + WS attack telemetry.
+Master-only + admin:
+- `GET /cluster/agents/`
+- `GET /api/cluster/agents`
+- `GET /api/cluster/agent/credentials`
+- `POST /api/cluster/agent/credentials`
+- `DELETE /api/cluster/agent/credentials`
+- `POST /api/cluster/agent/control`
 
-### GET /api/attacks/feed?limit=40
-Returns recent synthetic attack events.
+Agent-auth endpoints (token in JSON body):
+- `POST /api/cluster/agent/register`
+- `POST /api/cluster/agent/heartbeat`
+- `POST /api/cluster/agent/task/pull`
+- `POST /api/cluster/agent/task/submit`
 
-Response:
-```json
-{
-  "datas": [
-    {
-      "id": 145,
-      "timestamp": 1739050000,
-      "timestamp_iso": "2026-02-08T05:12:03Z",
-      "attack_type": "credential-stuffing",
-      "severity": "high",
-      "protocol": "tcp",
-      "port": 443,
-      "service": "https",
-      "action": "blocked",
-      "confidence": 0.91,
-      "packets": 41,
-      "bytes": 28412,
-      "src": {"ip": "185.220.101.45", "city": "Berlin", "country": "DE", "lat": 52.52, "lon": 13.405},
-      "dst": {"ip": "34.117.59.81", "city": "Ashburn", "country": "US", "lat": 39.0438, "lon": -77.4874, "asset": "api-gateway-prod"}
-    }
-  ],
-  "summary": {},
-  "simulator": {}
-}
-```
+Agent auth payload shape:
 
-### GET /api/attacks/summary
-Returns aggregate telemetry metrics (severity, top targets, recent activity).
-
-### POST /api/attacks/simulate
-Injects one synthetic event (useful for demos and integration tests).
-
-Body (optional overrides):
-```json
-{
-  "attack_type": "api-path-fuzzing",
-  "severity": "medium",
-  "protocol": "tcp",
-  "port": 443,
-  "service": "https",
-  "action": "challenged",
-  "src": {"ip": "203.0.113.8", "city": "Madrid", "country": "ES", "lat": 40.4168, "lon": -3.7038},
-  "dst": {"ip": "34.117.59.81", "city": "Ashburn", "country": "US", "lat": 39.0438, "lon": -77.4874, "asset": "api-gateway-prod"}
-}
-```
-
-### GET /api/attacks/simulator
-Returns simulator status.
-
-### POST /api/attacks/simulator
-Controls simulator state and optional burst generation.
-
-Body:
-```json
-{ "running": true, "burst": 5 }
-```
-
-## WebSocket demo API
-
-### GET /api/ws/clients
-List connected WS clients.
-
-### POST /api/ws/broadcast
-Broadcast a text/binary message to all WS clients.
-
-Body (text):
-```json
-{ "type": "text", "message": "hello" }
-```
-
-### POST /api/ws/ping
-Ping all WS clients.
-
-Body:
-```json
-{ "payload": "ping" }
-```
-
-### POST /api/ws/close
-Close one client or all clients.
-
-Body:
-```json
-{ "client_id": "...", "code": 1000, "reason": "bye" }
-```
-
-### GET /api/chat/messages?limit=20
-Returns chat messages stored in SQLite.
-
-### POST /api/chat/clear
-Clears chat messages.
-
-## WebSocket endpoint
-- `wss://HOST:PORT/ws/`
-
-The server echoes text messages and supports binary payloads. It also stores chat messages when they match `[alias] message` format.
-
-## Cluster master/agent endpoints
-
-### GET /api/cluster/agents
-Returns agents state snapshot (`online|stale|offline`) and active leases.
-
-### GET /api/cluster/ca
-Returns CA payload in three forms:
-- `ca_pem` (multiline PEM)
-- `ca_oneline` (single-line with `\\n`)
-- `export_command` (ready for terminal)
-
-### GET /api/cluster/ca/raw
-Downloads the CA as `.pem` file.
-
-### GET /api/cluster/ca/oneline
-Returns plain-text CA one-line value.
-
-### POST /api/cluster/agent/register
-Register an agent over mTLS.
-
-Body:
-```json
-{ "agent_id": "agent-01" }
-```
-
-### POST /api/cluster/agent/task/pull
-Pull next scheduled target.
-
-Body:
-```json
-{ "agent_id": "agent-01" }
-```
-
-### POST /api/cluster/agent/task/submit
-Submit scan results for a task.
-
-Body (shape):
 ```json
 {
   "agent_id": "agent-01",
-  "task_id": "....",
-  "master_target_id": 42,
-  "result": {
-    "progress": 100.0,
-    "status": "active",
-    "ports": [],
-    "tags": [],
-    "banners": [],
-    "favicons": []
-  }
+  "token": "<agent-token>"
 }
 ```
+
+Deprecated (always `410`):
+- `GET /api/cluster/ca`
+- `GET /api/cluster/ca/raw`
+- `GET /api/cluster/ca/oneline`
+- `POST /api/cluster/agent/enroll`
