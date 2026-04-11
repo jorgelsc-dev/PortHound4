@@ -11,5 +11,5 @@ Flujo esperado:
 
 - `getDBNIC.py` es el unico proceso que regenera/actualiza estos ficheros del repo.
 - `app.py` y `server.py` no descargan GeoIP ni generan datos propios de respaldo.
-- al arrancar, la app lee `geoip_blocks.seed.jsonl.gz` y lo importa a `Database.db`.
-- si `Database.db` no existe, se crea y se rellena desde ese seed versionado.
+- al arrancar, la app lee `geoip_blocks.seed.jsonl.gz` y lo importa a la DB activa (`PORTHOUND_DB_PATH`).
+- si la DB activa no existe, se crea y se rellena desde ese seed versionado.
