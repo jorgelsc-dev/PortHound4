@@ -276,6 +276,14 @@ Please report vulnerabilities privately. See `SECURITY.md`.
 
 ---
 
+## 💛 Support / Donations
+
+If PortHound helps your work and you want to support maintenance, you can donate in BTC:
+
+`bc1q3lhxpr9yantvefmvhpd2h4lu0ykf3t45zvuve2`
+
+---
+
 ## 📄 Licencia / License
 
 Este proyecto esta licenciado bajo la Licencia MIT. Consulta el archivo `LICENSE` para mas detalles.

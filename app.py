@@ -3319,12 +3319,34 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
       text-transform: uppercase;
       letter-spacing: 0.03em;
     }
+    .support-box {
+      margin: 10px 0 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 0.86rem;
+      color: #cbd5e1;
+    }
+    .support-box code {
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 6px 8px;
+      color: #fbbf24;
+      word-break: break-all;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Cluster Agents</h1>
     <p class="muted">Monitor de agentes + onboarding con token.</p>
+    <div class="support-box">
+      <span>Support PortHound (optional) BTC:</span>
+      <code id="btc-address">bc1q3lhxpr9yantvefmvhpd2h4lu0ykf3t45zvuve2</code>
+      <button id="copy-btc" type="button">Copy BTC</button>
+    </div>
     <div id="summary" class="grid"></div>
     <table>
       <thead>
@@ -3376,6 +3398,27 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
     const credentialsBody = document.getElementById("credentials-body");
     const newAgentIdEl = document.getElementById("new-agent-id");
     const newAgentOutputEl = document.getElementById("new-agent-output");
+    const copyBtcEl = document.getElementById("copy-btc");
+    const btcAddressEl = document.getElementById("btc-address");
+
+    if (copyBtcEl && btcAddressEl) {
+      copyBtcEl.addEventListener("click", async () => {
+        const value = String(btcAddressEl.textContent || "").trim();
+        if (!value) return;
+        try {
+          await navigator.clipboard.writeText(value);
+          copyBtcEl.textContent = "Copied";
+          setTimeout(() => {
+            copyBtcEl.textContent = "Copy BTC";
+          }, 1200);
+        } catch (err) {
+          copyBtcEl.textContent = "Copy manually";
+          setTimeout(() => {
+            copyBtcEl.textContent = "Copy BTC";
+          }, 1400);
+        }
+      });
+    }
 
     function escapeHtml(value) {
       return String(value || "")

@@ -36,6 +36,18 @@
 
       <v-spacer />
 
+      <v-btn
+        class="d-none d-lg-flex mr-2"
+        color="warning"
+        variant="outlined"
+        size="small"
+        prepend-icon="mdi-currency-btc"
+        :href="btcSupportLink"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Support BTC
+      </v-btn>
       <v-chip
         class="mr-2"
         :color="wsStateColor"
@@ -100,6 +112,9 @@ export default {
       } catch (err) {
         return raw;
       }
+    },
+    btcSupportLink() {
+      return "https://mempool.space/address/bc1q3lhxpr9yantvefmvhpd2h4lu0ykf3t45zvuve2";
     },
     brandIconSrc() {
       const base = (typeof process !== "undefined" && process.env && process.env.BASE_URL)

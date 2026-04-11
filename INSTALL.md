@@ -1,17 +1,19 @@
 # Install
 
 ## Requirements
-- Python 3.10+
+- Python 3.11+
 - Node.js 18+ (only for frontend)
 
 ## Backend
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python manage.py --tls-enabled 0
+python3 -m venv env
+env/bin/python -m pip install --upgrade pip
+env/bin/python manage.py
 ```
 
-For TLS/mTLS deployment, configure certificates as documented in `README.md`.
+Default run mode is `master` on `0.0.0.0:45678` with role DB (`Master.db` by default).
+
+For distributed mode (`master + agent`), follow `README.md` or `FAST_DOCKER.md`.
 
 ## Frontend
 ```bash
