@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 import tempfile
 import time
@@ -53,6 +54,30 @@ def _make_manage_args(**overrides):
     return SimpleNamespace(**values)
 
 
+def _write_launcher_profile(db_path, role):
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS launcher_config ("
+            "role TEXT NOT NULL,"
+            "env_key TEXT NOT NULL,"
+            "env_value TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            "PRIMARY KEY (role, env_key)"
+            ");"
+        )
+        cursor.execute(
+            "INSERT OR REPLACE INTO launcher_config (role, env_key, env_value) "
+            "VALUES (?, ?, ?);",
+            (str(role), "PORTHOUND_ROLE", str(role)),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
 class TestCidrValidation(unittest.TestCase):
     def setUp(self):
         self.base_target = {
@@ -78,6 +103,20 @@ class TestCidrValidation(unittest.TestCase):
     def test_app_normalize_target_canonicalizes_network(self):
         normalized = app.normalize_target_item(dict(self.base_target))
         self.assertEqual(normalized["network"], "10.0.0.0/24")
+
+    def test_app_normalize_target_supports_local_agent_mode(self):
+        payload = dict(self.base_target)
+        payload["agent_mode"] = "local"
+        normalized = app.normalize_target_item(payload)
+        self.assertEqual(normalized["agent_mode"], "local")
+        self.assertEqual(normalized["agent_id"], "local")
+
+    def test_app_normalize_target_requires_agent_id_for_specific_mode(self):
+        payload = dict(self.base_target)
+        payload["agent_mode"] = "agent"
+        payload["agent_id"] = ""
+        with self.assertRaises(ValueError):
+            app.normalize_target_item(payload)
 
 
 class TestLegacyHttpRequestRead(unittest.TestCase):
@@ -431,6 +470,155 @@ class TestClusterSecurityHelpers(unittest.TestCase):
                 app.cluster_leases.update(original_leases)
 
 
+class TestClusterLocalAgentHelpers(unittest.TestCase):
+    def test_local_placeholder_appears_in_cluster_snapshot(self):
+        with app.cluster_lock:
+            original_agents = dict(app.cluster_agents)
+            original_leases = dict(app.cluster_leases)
+            app.cluster_agents.clear()
+            app.cluster_leases.clear()
+        try:
+            app.register_local_cluster_agent_placeholder("local")
+            snapshot = app.build_cluster_agents_snapshot()
+            self.assertEqual(snapshot["summary"]["total_agents"], 1)
+            self.assertEqual(snapshot["datas"][0]["agent_id"], "local")
+        finally:
+            with app.cluster_lock:
+                app.cluster_agents.clear()
+                app.cluster_agents.update(original_agents)
+                app.cluster_leases.clear()
+                app.cluster_leases.update(original_leases)
+
+
+class TestClusterTaskRouting(unittest.TestCase):
+    def test_claim_task_for_agent_respects_target_agent_route(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "Database.db"
+            seed_path = tmp_path / "geoip_blocks.seed.jsonl"
+            seed_path.write_text(
+                json.dumps(
+                    {
+                        "kind": "meta",
+                        "format": "porthound.geoip.seed.v1",
+                        "generated_at": "2026-03-04T00:00:00Z",
+                        "rows": 0,
+                        "partial": False,
+                        "selected_rirs": [],
+                        "failed_rirs": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            db = server.DB(path=str(db_path), geoip_seed_path=str(seed_path))
+            db.create_tables()
+            db.insert_targets(
+                {
+                    "network": "10.40.0.0/24",
+                    "type": "common",
+                    "proto": "tcp",
+                    "port_mode": "preset",
+                    "port_start": 0,
+                    "port_end": 0,
+                    "timesleep": 0.5,
+                    "status": "active",
+                    "agent_mode": "random",
+                    "agent_id": "",
+                }
+            )
+            db.insert_targets(
+                {
+                    "network": "10.41.0.0/24",
+                    "type": "common",
+                    "proto": "tcp",
+                    "port_mode": "preset",
+                    "port_start": 0,
+                    "port_end": 0,
+                    "timesleep": 0.5,
+                    "status": "active",
+                    "agent_mode": "local",
+                    "agent_id": "local",
+                }
+            )
+            db.insert_targets(
+                {
+                    "network": "10.42.0.0/24",
+                    "type": "common",
+                    "proto": "tcp",
+                    "port_mode": "preset",
+                    "port_start": 0,
+                    "port_end": 0,
+                    "timesleep": 0.5,
+                    "status": "active",
+                    "agent_mode": "agent",
+                    "agent_id": "edge-01",
+                }
+            )
+
+            by_network = {row["network"]: row for row in db.select_targets()}
+            random_target_id = int(by_network["10.40.0.0/24"]["id"])
+            local_target_id = int(by_network["10.41.0.0/24"]["id"])
+            specific_target_id = int(by_network["10.42.0.0/24"]["id"])
+
+            original_db = app.scan_db
+            with app.cluster_lock:
+                original_agents = dict(app.cluster_agents)
+                original_leases = dict(app.cluster_leases)
+                app.cluster_agents.clear()
+                app.cluster_leases.clear()
+            app.scan_db = db
+            try:
+                edge_task = app.claim_task_for_agent("edge-01")
+                self.assertIsNotNone(edge_task)
+                self.assertEqual(edge_task["target"]["master_target_id"], specific_target_id)
+
+                local_task = app.claim_task_for_agent("local")
+                self.assertIsNotNone(local_task)
+                self.assertEqual(local_task["target"]["master_target_id"], local_target_id)
+
+                other_task = app.claim_task_for_agent("edge-02")
+                self.assertIsNotNone(other_task)
+                self.assertEqual(other_task["target"]["master_target_id"], random_target_id)
+            finally:
+                app.scan_db = original_db
+                with app.cluster_lock:
+                    app.cluster_agents.clear()
+                    app.cluster_agents.update(original_agents)
+                    app.cluster_leases.clear()
+                    app.cluster_leases.update(original_leases)
+                db.conn.close()
+
+
+class TestAgentStatusView(unittest.TestCase):
+    def test_build_agent_status_snapshot_shape(self):
+        snapshot = app.build_agent_status_snapshot()
+        self.assertIn("generated_at", snapshot)
+        self.assertIn("agent_runtime", snapshot)
+        self.assertIn("summary", snapshot)
+        self.assertIn("targets", snapshot)
+
+    def test_root_view_agent_mode_returns_agent_payload(self):
+        original_role = str(getattr(app.settings, "ROLE", "master") or "master")
+        try:
+            app.settings.ROLE = "agent"
+            request = framework.Request(
+                method="GET",
+                path="/",
+                query_string="",
+                headers={},
+                body=b"",
+                client=("127.0.0.1", 0),
+            )
+            response = app.root_view(request)
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.body.decode("utf-8"))
+            self.assertIn("agent_runtime", payload)
+            self.assertEqual(payload.get("role"), "agent")
+        finally:
+            app.settings.ROLE = original_role
+
+
 class TestChartAnalytics(unittest.TestCase):
     def test_build_chart_analytics_example_payload_shape(self):
         payload = app.build_chart_analytics(example=True)
@@ -470,7 +658,7 @@ class TestManageInteractiveFallback(unittest.TestCase):
             )
         self.assertTrue(enabled)
 
-    def test_auto_interactive_when_no_cli_overrides_even_with_profile(self):
+    def test_auto_interactive_disabled_when_no_missing_required(self):
         args = _make_manage_args()
         with mock.patch.object(manage, "_is_interactive_terminal", return_value=True):
             enabled = manage._should_auto_interactive(
@@ -479,7 +667,7 @@ class TestManageInteractiveFallback(unittest.TestCase):
                 missing_required=[],
                 has_non_interactive_cli_overrides=False,
             )
-        self.assertTrue(enabled)
+        self.assertFalse(enabled)
 
     def test_auto_interactive_disabled_when_cli_overrides_exist(self):
         args = _make_manage_args(role="master")
@@ -496,6 +684,88 @@ class TestManageInteractiveFallback(unittest.TestCase):
         self.assertFalse(manage._has_non_interactive_cli_overrides([]))
         self.assertFalse(manage._has_non_interactive_cli_overrides(["--interactive"]))
         self.assertTrue(manage._has_non_interactive_cli_overrides(["--role", "master"]))
+
+    def test_apply_positional_mode_and_enroll_supports_base64_only(self):
+        args = _make_manage_args(
+            mode="eyJ2ZXJzaW9uIjoxfQ==",
+            role="",
+            host="",
+            agent_enroll="",
+        )
+        manage._apply_positional_mode_and_enroll(args)
+        self.assertEqual(args.role, "agent")
+        self.assertEqual(args.agent_enroll, "eyJ2ZXJzaW9uIjoxfQ==")
+
+    def test_apply_positional_mode_and_enroll_legacy_two_positionals_uses_second_payload(self):
+        args = _make_manage_args(
+            mode="127.0.0.1",
+            enroll_payload="eyJ2ZXJzaW9uIjoxfQ==",
+            role="",
+            agent_enroll="",
+        )
+        manage._apply_positional_mode_and_enroll(args)
+        self.assertEqual(args.role, "agent")
+        self.assertEqual(args.agent_enroll, "eyJ2ZXJzaW9uIjoxfQ==")
+
+    def test_apply_positional_mode_and_enroll_defaults_to_master_no_args(self):
+        args = _make_manage_args(mode="", enroll_payload="", role="", host="")
+        manage._apply_positional_mode_and_enroll(args)
+        self.assertEqual(args.role, "master")
+
+    def test_apply_positional_mode_and_enroll_supports_explicit_role_positional(self):
+        args = _make_manage_args(mode="master", enroll_payload="", role="", host="")
+        manage._apply_positional_mode_and_enroll(args)
+        self.assertEqual(args.role, "master")
+
+    def test_apply_positional_mode_and_enroll_treats_single_positional_as_enroll(self):
+        args = _make_manage_args(
+            mode="eyJ2ZXJzaW9uIjoxfQ==",
+            enroll_payload="",
+            role="",
+            agent_enroll="",
+        )
+        manage._apply_positional_mode_and_enroll(args)
+        self.assertEqual(args.role, "agent")
+        self.assertEqual(args.agent_enroll, "eyJ2ZXJzaW9uIjoxfQ==")
+
+    def test_enforce_fixed_web_port_master_role(self):
+        args = _make_manage_args(role="master", host="0.0.0.0", port=9999)
+        manage._enforce_fixed_web_port(args)
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 45678)
+
+    def test_enforce_fixed_web_port_agent_role(self):
+        args = _make_manage_args(role="agent", host="192.168.1.55", port=45678)
+        manage._enforce_fixed_web_port(args)
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 45677)
+
+    def test_detect_persisted_bootstrap_role_prefers_agent_when_only_agent_profile_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            role_paths = {
+                "master": str(tmp_path / "Master.db"),
+                "agent": str(tmp_path / "Agent.db"),
+                "standalone": str(tmp_path / "Standalone.db"),
+            }
+            _write_launcher_profile(role_paths["agent"], "agent")
+            with mock.patch.dict(manage.ROLE_DEFAULT_DB_PATHS, role_paths, clear=True):
+                detected = manage.detect_persisted_bootstrap_role(default_role="master")
+            self.assertEqual(detected, "agent")
+
+    def test_detect_persisted_bootstrap_role_prefers_master_on_conflict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            role_paths = {
+                "master": str(tmp_path / "Master.db"),
+                "agent": str(tmp_path / "Agent.db"),
+                "standalone": str(tmp_path / "Standalone.db"),
+            }
+            _write_launcher_profile(role_paths["master"], "master")
+            _write_launcher_profile(role_paths["agent"], "agent")
+            with mock.patch.dict(manage.ROLE_DEFAULT_DB_PATHS, role_paths, clear=True):
+                detected = manage.detect_persisted_bootstrap_role(default_role="master")
+            self.assertEqual(detected, "master")
 
 
 class TestLauncherProfileCertPersistence(unittest.TestCase):
