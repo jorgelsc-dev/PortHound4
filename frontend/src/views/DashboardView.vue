@@ -114,7 +114,9 @@
           :loading="loading"
           :error="error"
           :show-refresh="false"
+          :live-refresh="true"
           empty-text="No targets"
+          @refresh="load"
         >
           <template #cell-progress="{ value }">
             <ProgressCell :value="value" />
@@ -186,7 +188,9 @@
           :loading="loading"
           :error="error"
           :show-refresh="false"
+          :live-refresh="true"
           empty-text="No banners"
+          @refresh="load"
         >
           <template #cell-response_plain="{ value }">
             <span class="banner-cell">{{ value }}</span>

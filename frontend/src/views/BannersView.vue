@@ -63,6 +63,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       empty-text="No banners found"
       @refresh="load"
     >
@@ -122,6 +123,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       empty-text="No favicons found"
       @refresh="load"
     >

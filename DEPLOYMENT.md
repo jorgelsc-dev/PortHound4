@@ -5,100 +5,64 @@
 python manage.py
 ```
 
-For a quick GHCR-based `master + agent` deployment, see `FAST_DOCKER.md`.
+## Debian / APT package (`.deb`)
 
-## Docker image by branch (GitHub Actions)
-- Workflow: `.github/workflows/docker-branches.yml`
-- Trigger: push to `develop` or `production`
-- Image registry: `ghcr.io`
-- Generated tags:
-  - `develop` branch -> `ghcr.io/<owner>/porthound4:develop`
-  - `production` branch -> `ghcr.io/<owner>/porthound4:production`
+Build:
 
-### Commands to trigger from git
 ```bash
-# develop
-git checkout develop
-git push origin develop
-
-# production
-git checkout production
-git push origin production
+./packaging/deb/build.sh
 ```
 
-### Equivalent local Docker commands
-```bash
-IMAGE=ghcr.io/<owner>/porthound4
+Install:
 
-docker build -t ${IMAGE}:develop .
-docker build -t ${IMAGE}:production .
+```bash
+sudo apt install ./dist/deb/porthound4_<version>-1_all.deb
 ```
 
-### Push manually to GHCR (optional)
-Use a token with `write:packages`.
+Service defaults:
+
+```text
+/etc/default/porthound4
+```
+
+Enable/start service:
 
 ```bash
-IMAGE=ghcr.io/<owner>/porthound4
-echo "<GHCR_TOKEN>" | docker login ghcr.io -u "<owner>" --password-stdin
+sudo systemctl enable --now porthound4
+sudo systemctl status porthound4
+```
 
-docker push ${IMAGE}:develop
-docker push ${IMAGE}:production
+## Portable ZIP package
+
+Build:
+
+```bash
+./packaging/zip/build.sh
+```
+
+Use:
+
+```bash
+unzip dist/zip/porthound4_<version>-1.zip
+cd porthound4_<version>-1
+python3 manage.py
 ```
 
 ## GitHub Release automatico (main)
+
 - Workflow: `.github/workflows/package.yml`
-- Trigger: push a `main` (o tag con prefijo `v`)
-- Resultado: compila artefactos y crea un GitHub Release con assets adjuntos.
-- En `main` se genera un tag automatico con formato `main-<run>.<attempt>-<sha7>`.
-
-### Comandos para release estable (main, automatico)
-```bash
-git checkout main
-git pull origin main
-git push origin main
-```
-
-### Comandos opcionales para release por version (tag)
-```bash
-# ejemplo release versionada
-git checkout main
-git pull origin main
-git tag v1.2.0
-git push origin v1.2.0
-```
-
-## Systemd (Linux)
-Create a service file at `/etc/systemd/system/porthound.service`:
-
-```
-[Unit]
-Description=PortHound
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/porthound
-ExecStart=/usr/bin/python3 /opt/porthound/manage.py
-Restart=always
-User=porthound
-Group=porthound
-Environment=PORTHOUND_API_TOKEN=change-me
-Environment=PORTHOUND_CORS_ALLOW_ORIGIN=https://your-ui.example
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable porthound
-sudo systemctl start porthound
-```
+- Trigger: push a `main` (o `workflow_dispatch`)
+- Resultado: crea release y publica 2 assets:
+  - `porthound4_<version>-<rev>_all.deb`
+  - `porthound4_<version>-<rev>.zip`
+- Tag automatico en `main`: `main-<run>.<attempt>-<sha7>`
 
 ## Reverse proxy (optional)
+
 Place Nginx or Caddy in front if you need TLS, auth, or rate limits.
 
 ## Notes
+
 - Ensure the process has write access to the role DB path (`PORTHOUND_DB_PATH`).
 - Default role DB names:
   - `master` -> `Master.db`

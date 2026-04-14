@@ -65,6 +65,7 @@ export default {
         { label: "Banners", to: "/banners", icon: "mdi-card-text" },
         { label: "Tags", to: "/tags", icon: "mdi-tag-outline" },
         { label: "Catalog", to: "/catalog", icon: "mdi-database-edit-outline" },
+        { label: "Seed Files", to: "/catalog-files", icon: "mdi-file-cog-outline" },
         { label: "API", to: "/api", icon: "mdi-api" },
       ],
     };

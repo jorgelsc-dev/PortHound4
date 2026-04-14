@@ -14,6 +14,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       @refresh="load"
     >
       <template #skeleton>
@@ -133,7 +134,7 @@
                 <td>{{ row.ip }}</td>
                 <td>{{ row.port }}</td>
                 <td>{{ row.proto }}</td>
-                <td>{{ row.state }}</td>
+                <td :title="formatStateTooltip(row)">{{ formatStateLabel(row) }}</td>
                 <td>
                   <span class="ellipsis-cell">{{ row.banner || "-" }}</span>
                 </td>
@@ -595,7 +596,7 @@
                 <tr v-for="row in intelHostServices" :key="`svc-${row.proto}-${row.port}`">
                   <td>{{ row.port }}</td>
                   <td>{{ row.proto || "-" }}</td>
-                  <td>{{ row.state || "-" }}</td>
+                  <td :title="formatStateTooltip(row)">{{ formatStateLabel(row) }}</td>
                   <td>{{ joinList(row.service) }}</td>
                   <td>{{ joinList(row.product) }}</td>
                   <td>{{ joinList(row.version) }}</td>
@@ -1380,6 +1381,25 @@ export default {
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) return "-";
       return `${numeric.toFixed(1)}%`;
+    },
+    formatStateLabel(row) {
+      const proto = String(row?.proto || "").trim().toLowerCase();
+      const state = String(row?.state || "").trim().toLowerCase();
+      if (!state) return "-";
+      if (proto === "icmp" && state === "filtered") return "no reply";
+      return state;
+    },
+    formatStateTooltip(row) {
+      const proto = String(row?.proto || "").trim().toLowerCase();
+      const state = String(row?.state || "").trim().toLowerCase();
+      if (!state) return "-";
+      if (proto === "icmp" && state === "filtered") {
+        return "ICMP echo reply was not received. The host may be down or a firewall may be dropping the probe.";
+      }
+      if (proto === "icmp" && state === "open") {
+        return "ICMP echo reply received.";
+      }
+      return state;
     },
     formatSize(value) {
       const bytes = Number(value || 0);

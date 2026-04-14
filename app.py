@@ -3,6 +3,7 @@ import mimetypes
 import random
 import sqlite3
 import re
+import hmac
 import errno
 import base64
 import socket
@@ -16,6 +17,7 @@ from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, ip_address, ip_network
 from pathlib import Path
+from urllib.parse import urlsplit
 import settings
 from framework import App, Response, Route, parse_close_payload
 
@@ -31,8 +33,15 @@ from server import (
     TARGET_PROTOS,
     TARGET_STATUSES,
     TARGET_PORT_MODES,
+    TARGET_AGENT_MODES,
+    LOCAL_CLUSTER_AGENT_ID,
     PORT_SCAN_STATUSES,
     normalize_target_port_config,
+    normalize_target_agent_config,
+    DEFAULT_BANNER_RULES_FILE,
+    DEFAULT_BANNER_REQUESTS_FILE,
+    DEFAULT_IP_PRESETS_FILE,
+    _normalize_ip_value,
 )
 from ws_demo import INDEX_HTML, Database, ChatMessage, parse_chat_line, ClientRegistry
 
@@ -87,6 +96,8 @@ EXAMPLE_TARGETS = [
         "port_mode": "preset",
         "port_start": 0,
         "port_end": 0,
+        "agent_mode": "random",
+        "agent_id": "",
         "status": "active",
         "timesleep": 0.5,
         "progress": 62.5,
@@ -101,6 +112,8 @@ EXAMPLE_TARGETS = [
         "port_mode": "range",
         "port_start": 500,
         "port_end": 2000,
+        "agent_mode": "local",
+        "agent_id": "local",
         "status": "stopped",
         "timesleep": 1.0,
         "progress": 14.0,
@@ -2954,7 +2967,7 @@ class AttackTelemetry:
 
 
 class ScanMapTelemetry:
-    def __init__(self, ws_registry, interval_seconds=5.0):
+    def __init__(self, ws_registry, interval_seconds=2.0):
         self.registry = ws_registry
         self.interval_seconds = float(interval_seconds)
         self._thread = None
@@ -3365,7 +3378,7 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
 
     <h2 style="margin-top:26px;">Agent Onboarding</h2>
     <div class="toolbar">
-      <input id="new-agent-id" type="text" placeholder="agent_id opcional (ej: edge-havana-01)">
+      <input id="new-agent-id" type="text" placeholder="agent_id opcional (ej: edge-agent-01)">
       <button id="create-agent-credential">Agregar agente</button>
       <button id="copy-agent-output">Copiar datos</button>
     </div>
@@ -3555,21 +3568,10 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
         enrollBase64,
         "",
         "COMANDO RAPIDO BASE64 (copiar/pegar en el agente):",
-        `env/bin/python manage.py agent --enroll '${enrollBase64}'`,
+        `env/bin/python manage.py '${enrollBase64}'`,
         "",
         "COMANDO RAPIDO (copiar/pegar en el agente):",
         quickCommand,
-        "",
-        "En el agente (recomendado):",
-        "env/bin/python manage.py --interactive",
-        "",
-        "Respuestas para el wizard del agente:",
-        "Role (master/agent/standalone): agent",
-        `Master URL (http://host:port): ${masterBase}`,
-        `Agent identifier: ${agentId}`,
-        `Agent token: ${token}`,
-        "Poll seconds: 8",
-        "HTTP timeout (seconds): 20",
         "",
         "Si quieres por variables de entorno:",
         `export PORTHOUND_ROLE='agent'`,
@@ -3671,11 +3673,199 @@ CLUSTER_AGENTS_HTML = """<!doctype html>
 </html>
 """
 
+AGENT_STATUS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PortHound Agent Status</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      font-family: Consolas, Monaco, "Courier New", monospace;
+      background: #020617;
+      color: #e2e8f0;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 20px auto;
+      padding: 0 16px 24px;
+    }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; color: #93c5fd; }
+    .muted { color: #94a3b8; margin: 0 0 14px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .k { color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .v { font-size: 1.18rem; font-weight: 700; margin-top: 4px; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.86rem;
+      background: #0b1220;
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      padding: 10px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td {
+      font-size: 0.86rem;
+      text-align: left;
+      vertical-align: top;
+      padding: 8px 7px;
+      border-bottom: 1px solid #1f2937;
+    }
+    th { color: #93c5fd; background: #0b1220; }
+    .status-online { color: #22c55e; }
+    .status-offline { color: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Agent Status</h1>
+    <p class="muted">Vista simple del nodo agente (actualizacion automatica).</p>
+    <div id="summary" class="grid"></div>
+    <div class="card" style="margin-bottom:10px;">
+      <div class="k">Current task</div>
+      <pre id="current-task">Loading...</pre>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Network</th><th>Proto</th><th>Status</th><th>Progress</th><th>Updated</th>
+        </tr>
+      </thead>
+      <tbody id="targets-body"></tbody>
+    </table>
+  </div>
+  <script>
+    const summaryEl = document.getElementById("summary");
+    const currentTaskEl = document.getElementById("current-task");
+    const targetsBody = document.getElementById("targets-body");
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function asPct(value) {
+      const num = Number(value || 0);
+      if (!Number.isFinite(num)) return "0%";
+      return `${Math.max(0, Math.min(100, num)).toFixed(1)}%`;
+    }
+
+    function renderSummary(payload) {
+      const web = payload.web || {};
+      const summary = payload.summary || {};
+      const runtime = payload.agent_runtime || {};
+      const agent = payload.agent || {};
+      const cards = [
+        ["Role", payload.role || "agent"],
+        ["Runtime", runtime.alive ? "online" : "offline"],
+        ["Agent ID", agent.agent_id || "-"],
+        ["Master", agent.master || "-"],
+        ["Web", `${web.host || "127.0.0.1"}:${web.port || "-"}`],
+        ["Targets", summary.targets_total || 0],
+        ["Active", summary.active || 0],
+        ["Ports", summary.ports || 0],
+      ];
+      summaryEl.innerHTML = cards.map(([k, v]) => {
+        const value = String(v);
+        const css = (k === "Runtime" && value === "online")
+          ? "status-online"
+          : (k === "Runtime" ? "status-offline" : "");
+        return `<div class="card"><div class="k">${escapeHtml(k)}</div><div class="v ${css}">${escapeHtml(value)}</div></div>`;
+      }).join("");
+    }
+
+    function renderCurrentTask(payload) {
+      const current = payload.current_task;
+      if (!current) {
+        currentTaskEl.textContent = "Idle: waiting for task from master.";
+        return;
+      }
+      const lines = [
+        `id: ${current.id}`,
+        `network: ${current.network || "-"}`,
+        `proto: ${current.proto || "-"}`,
+        `status: ${current.status || "-"}`,
+        `progress: ${asPct(current.progress)}`,
+        `updated_at: ${current.updated_at || "-"}`,
+      ];
+      currentTaskEl.textContent = lines.join("\\n");
+    }
+
+    function renderTargets(payload) {
+      const rows = Array.isArray(payload.targets) ? payload.targets : [];
+      if (!rows.length) {
+        targetsBody.innerHTML = "<tr><td colspan='6'>No local targets.</td></tr>";
+        return;
+      }
+      targetsBody.innerHTML = rows.map((row) => (
+        `<tr>
+          <td>${escapeHtml(row.id)}</td>
+          <td>${escapeHtml(row.network)}</td>
+          <td>${escapeHtml(String(row.proto || "").toUpperCase())}</td>
+          <td>${escapeHtml(row.status)}</td>
+          <td>${escapeHtml(asPct(row.progress))}</td>
+          <td>${escapeHtml(row.updated_at || "-")}</td>
+        </tr>`
+      )).join("");
+    }
+
+    async function load() {
+      try {
+        const res = await fetch("/api/agent/status");
+        const payload = await res.json();
+        renderSummary(payload || {});
+        renderCurrentTask(payload || {});
+        renderTargets(payload || {});
+      } catch (err) {
+        currentTaskEl.textContent = `Error: ${String(err)}`;
+      }
+    }
+
+    load();
+    setInterval(load, 2500);
+  </script>
+</body>
+</html>
+"""
+
 API_ENDPOINTS = [
     {"method": "GET", "path": "/api/dashboard/", "desc": "Frontend dashboard snapshot."},
     {"method": "GET", "path": "/api/charts/analytics", "desc": "Aggregated analytics series for chart dashboards."},
     {"method": "GET", "path": "/api/endpoints/", "desc": "Endpoint catalog."},
     {"method": "GET", "path": "/api/map/scan", "desc": "Geolocated scan map snapshot."},
+    {"method": "GET", "path": "/api/catalog/file/banner-rules", "desc": "List banner regex rules from file."},
+    {"method": "POST", "path": "/api/catalog/file/banner-rules", "desc": "Append banner regex rule to file + DB."},
+    {"method": "GET", "path": "/api/catalog/file/banner-requests", "desc": "List banner probe requests from file."},
+    {"method": "POST", "path": "/api/catalog/file/banner-requests", "desc": "Append banner probe request to file + DB."},
+    {"method": "GET", "path": "/api/catalog/file/ip-presets", "desc": "List IP presets from file."},
+    {"method": "POST", "path": "/api/catalog/file/ip-presets", "desc": "Append IP preset to file + DB."},
     {"method": "GET", "path": "/api/catalog/banner-rules/", "desc": "List regex banner rules (builtin + custom)."},
     {"method": "POST", "path": "/api/catalog/banner-rules/", "desc": "Create custom regex banner rule."},
     {"method": "PUT", "path": "/api/catalog/banner-rules/", "desc": "Update custom regex banner rule."},
@@ -3719,6 +3909,7 @@ API_ENDPOINTS = [
     {"method": "POST", "path": "/api/ws/close", "desc": "Close WS client(s)."},
     {"method": "GET", "path": "/api/chat/messages", "desc": "List chat messages."},
     {"method": "POST", "path": "/api/chat/clear", "desc": "Clear chat messages."},
+    {"method": "GET", "path": "/api/agent/status", "desc": "Local agent runtime status snapshot."},
     {"method": "GET", "path": "/cluster/agents/", "desc": "Cluster agents web view."},
     {"method": "GET", "path": "/api/cluster/agents", "desc": "List agents and status."},
     {"method": "GET", "path": "/api/cluster/agent/credentials", "desc": "List agent token credentials."},
@@ -3742,23 +3933,179 @@ scan_map_telemetry = ScanMapTelemetry(registry)
 cluster_lock = threading.Lock()
 cluster_agents = {}
 cluster_leases = {}
+_local_cluster_agent_lock = threading.Lock()
+_local_cluster_agent_thread = None
+_local_cluster_agent_db = None
+_local_cluster_agent_scanner_threads = []
+_agent_mode_runtime_lock = threading.Lock()
+_agent_mode_runtime_thread = None
+_agent_mode_runtime_started_at = 0.0
+_agent_mode_runtime_last_error = ""
+_agent_mode_runtime = None
 inline_ca_lock = threading.Lock()
 inline_ca_tempfile_path = ""
 
 
-def start_scanners():
+def start_scanners_for_db(db, thread_store=None):
+    threads_ref = thread_store if isinstance(thread_store, list) else _scanner_threads
+    if any(thread.is_alive() for thread in threads_ref):
+        return
     threads = [
-        TCP(db=scan_db),
-        UDP(db=scan_db),
-        ICMP(db=scan_db),
-        BannerTCP(db=scan_db),
-        BannerUDP(db=scan_db),
+        TCP(db=db),
+        UDP(db=db),
+        ICMP(db=db),
+        BannerTCP(db=db),
+        BannerUDP(db=db),
     ]
     if "sctp" in TARGET_PROTOS:
-        threads.insert(2, SCTP(db=scan_db))
+        threads.insert(2, SCTP(db=db))
     for t in threads:
         t.start()
-    _scanner_threads.extend(threads)
+    threads_ref.extend(threads)
+
+
+def start_scanners():
+    start_scanners_for_db(scan_db, _scanner_threads)
+
+
+def build_local_cluster_master_base_url():
+    host = str(getattr(settings, "HOST", "") or "").strip()
+    host_lower = host.lower()
+    if not host or host_lower in {"0.0.0.0", "::", "localhost", "::1"}:
+        host = "127.0.0.1"
+    try:
+        port = int(getattr(settings, "PORT", 45678) or 45678)
+    except Exception:
+        port = 45678
+    if ":" in host and not host.startswith("[") and not host.endswith("]"):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def build_local_cluster_agent_db_path():
+    master_db_path = str(getattr(settings, "SCAN_DB_PATH", "Master.db") or "Master.db").strip()
+    if not master_db_path:
+        master_db_path = "Master.db"
+    db_path = Path(master_db_path)
+    stem = db_path.stem or "Master"
+    suffix = db_path.suffix or ".db"
+    return str(db_path.with_name(f"{stem}.local_agent{suffix}"))
+
+
+def register_local_cluster_agent_placeholder(agent_id="local"):
+    local_agent_id = str(agent_id or "").strip() or "local"
+    try:
+        local_port = int(getattr(settings, "PORT", 45678) or 45678)
+    except Exception:
+        local_port = 45678
+    with cluster_lock:
+        existing = cluster_agents.get(local_agent_id, {})
+        status_note = str((existing or {}).get("status_note", "")).strip() or "local_agent"
+        cluster_agents[local_agent_id] = {
+            "agent_id": local_agent_id,
+            "cn": str((existing or {}).get("cn", "")).strip(),
+            "auth_mode": str((existing or {}).get("auth_mode", "token") or "token").strip().lower()
+            or "token",
+            "last_seen": float((existing or {}).get("last_seen", 0.0) or 0.0),
+            "client": (existing or {}).get("client") or ("127.0.0.1", local_port),
+            "status_note": status_note,
+        }
+    return local_agent_id
+
+
+def _build_local_agent_runtime():
+    from agent import AgentRuntime
+
+    global _local_cluster_agent_db
+    local_agent_id = register_local_cluster_agent_placeholder("local")
+    local_db_path = build_local_cluster_agent_db_path()
+    if _local_cluster_agent_db is None:
+        _local_cluster_agent_db = DB(path=local_db_path)
+    _local_cluster_agent_db.create_tables()
+    scan_db.create_tables()
+    credential = scan_db.create_cluster_agent_credential({"agent_id": local_agent_id})
+    token = str(credential.get("token", "") or credential.get("agent_key", "")).strip()
+    if not token:
+        raise RuntimeError("Unable to provision local cluster agent token")
+
+    return AgentRuntime(
+        db=_local_cluster_agent_db,
+        master_base_url=build_local_cluster_master_base_url(),
+        agent_id=local_agent_id,
+        agent_token=token,
+        poll_seconds=max(2, int(getattr(settings, "AGENT_POLL_SECONDS", 8) or 8)),
+        http_timeout=max(2.0, float(getattr(settings, "AGENT_HTTP_TIMEOUT", 20.0) or 20.0)),
+    )
+
+
+def start_local_cluster_agent():
+    if current_role() != "master":
+        return
+    global _local_cluster_agent_thread
+    with _local_cluster_agent_lock:
+        if _local_cluster_agent_thread is not None and _local_cluster_agent_thread.is_alive():
+            return
+        runtime = _build_local_agent_runtime()
+        local_agent_id = str(getattr(runtime, "agent_id", "local") or "local").strip() or "local"
+        local_master = str(getattr(runtime, "master_base_url", "") or "").strip()
+        register_local_cluster_agent_placeholder(local_agent_id)
+
+        def _local_agent_loop():
+            try:
+                runtime.db.create_tables()
+                start_scanners_for_db(runtime.db, _local_cluster_agent_scanner_threads)
+                runtime.run_forever()
+            except Exception as exc:
+                print(f"[cluster] local agent loop stopped: {exc}")
+                register_local_cluster_agent_placeholder(local_agent_id)
+
+        _local_cluster_agent_thread = threading.Thread(
+            target=_local_agent_loop,
+            name="porthound-local-agent",
+            daemon=True,
+        )
+        _local_cluster_agent_thread.start()
+        print(
+            "[cluster] local agent enabled "
+            f"agent_id={local_agent_id} master={local_master}"
+        )
+
+
+def start_agent_runtime_background():
+    if current_role() != "agent":
+        return
+    global _agent_mode_runtime_thread
+    global _agent_mode_runtime_started_at
+    global _agent_mode_runtime_last_error
+    global _agent_mode_runtime
+    with _agent_mode_runtime_lock:
+        if _agent_mode_runtime_thread is not None and _agent_mode_runtime_thread.is_alive():
+            return
+        from agent import AgentRuntime
+
+        runtime = AgentRuntime(db=scan_db)
+        _agent_mode_runtime = runtime
+        _agent_mode_runtime_last_error = ""
+
+        def _runtime_loop():
+            global _agent_mode_runtime_last_error
+            try:
+                runtime.run_forever()
+            except Exception as exc:
+                _agent_mode_runtime_last_error = str(exc)
+                print(f"[agent] runtime stopped: {exc}")
+
+        _agent_mode_runtime_thread = threading.Thread(
+            target=_runtime_loop,
+            name="porthound-agent-runtime",
+            daemon=True,
+        )
+        _agent_mode_runtime_started_at = time.time()
+        _agent_mode_runtime_thread.start()
+        print(
+            "[agent] runtime+web enabled "
+            f"agent_id={runtime.agent_id} master={runtime.master_base_url}"
+        )
 
 
 def start_geoip_blocks_db():
@@ -3837,6 +4184,43 @@ def wants_html(request):
 def json_error(message, status=500):
     return Response.json({"status": str(message)}, status=status)
 
+def _read_catalog_file(path: Path, key: str):
+    payload = {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    rows = payload.get(key, [])
+    if not isinstance(rows, list):
+        rows = []
+    return payload, rows
+
+
+def _write_catalog_file(path: Path, key: str, rows: list):
+    payload, _ = _read_catalog_file(path, key)
+    payload = dict(payload or {})
+    payload["version"] = int(payload.get("version", 1) or 1)
+    payload[key] = rows
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _dedupe_by_key(rows, key_name):
+    seen = set()
+    output = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key_value = str(row.get(key_name, "") or "").strip()
+        if not key_value or key_value in seen:
+            continue
+        seen.add(key_value)
+        output.append(row)
+    return output
+
 
 def current_role():
     value = str(getattr(settings, "ROLE", "master") or "master").strip().lower()
@@ -3877,13 +4261,37 @@ def _extract_request_token(request):
     return str(headers.get("x-api-key", "") or headers.get("X-API-Key", "")).strip()
 
 
+def _extract_request_origin(request):
+    headers = getattr(request, "headers", {}) or {}
+    return str(
+        headers.get("origin", "")
+        or headers.get("Origin", "")
+    ).strip()
+
+
+def _is_loopback_origin(origin):
+    raw_origin = str(origin or "").strip()
+    if not raw_origin:
+        return False
+    parsed = urlsplit(raw_origin)
+    if str(parsed.scheme or "").strip().lower() not in {"http", "https"}:
+        return False
+    host = str(parsed.hostname or "").strip()
+    if not host:
+        return False
+    try:
+        return ip_address(host).is_loopback
+    except Exception:
+        return host.lower() == "localhost"
+
+
 def require_admin_access(request):
     configured_token = str(getattr(settings, "API_TOKEN", "") or "").strip()
     require_token = bool(getattr(settings, "API_REQUIRE_TOKEN", False))
 
     if configured_token:
         provided_token = _extract_request_token(request)
-        if provided_token == configured_token:
+        if hmac.compare_digest(provided_token, configured_token):
             return None
         return json_error("Unauthorized", status=401)
 
@@ -3891,6 +4299,13 @@ def require_admin_access(request):
         return json_error("Unauthorized", status=401)
 
     if _is_loopback_client(request):
+        origin = _extract_request_origin(request)
+        if origin and not _is_loopback_origin(origin):
+            return json_error(
+                "Admin access denied for untrusted Origin on loopback. "
+                "Configure PORTHOUND_API_TOKEN.",
+                status=403,
+            )
         return None
     return json_error(
         "Admin access denied for non-loopback client. Configure PORTHOUND_API_TOKEN.",
@@ -4143,6 +4558,27 @@ def _serialize_target_task(target_row):
     }
 
 
+def _normalize_target_agent_mode(value):
+    mode = str(value or "").strip().lower()
+    if mode in TARGET_AGENT_MODES:
+        return mode
+    return "random"
+
+
+def _target_agent_route_matches(target_row, agent_id):
+    row = target_row if isinstance(target_row, dict) else {}
+    agent_value = str(agent_id or "").strip()
+    if not agent_value:
+        return False
+    mode = _normalize_target_agent_mode(row.get("agent_mode", "random"))
+    target_agent_id = str(row.get("agent_id", "") or "").strip()
+    if mode == "local":
+        return agent_value == LOCAL_CLUSTER_AGENT_ID
+    if mode == "agent":
+        return bool(target_agent_id) and agent_value == target_agent_id
+    return True
+
+
 def claim_task_for_agent(agent_id):
     agent_value = str(agent_id or "").strip()
     if not agent_value:
@@ -4158,7 +4594,7 @@ def claim_task_for_agent(agent_id):
             if float(lease.get("lease_until", 0.0)) <= now_ts:
                 continue
             target = scan_db.select_target_by_id(int(target_id))
-            if target and _is_target_schedulable(target):
+            if target and _is_target_schedulable(target) and _target_agent_route_matches(target, agent_value):
                 return {
                     "task_id": str(lease.get("task_id")),
                     "lease_seconds": max(
@@ -4167,14 +4603,28 @@ def claim_task_for_agent(agent_id):
                     ),
                     "target": _serialize_target_task(target),
                 }
+            cluster_leases.pop(int(target_id), None)
 
-        candidates = [row for row in scan_db.select_targets() if _is_target_schedulable(row)]
-        candidates.sort(
+        candidates_all = [
+            row
+            for row in scan_db.select_targets()
+            if _is_target_schedulable(row) and _target_agent_route_matches(row, agent_value)
+        ]
+        dedicated = []
+        shared = []
+        for row in candidates_all:
+            if _normalize_target_agent_mode((row or {}).get("agent_mode")) == "random":
+                shared.append(row)
+            else:
+                dedicated.append(row)
+        dedicated.sort(
             key=lambda row: (
                 float((row or {}).get("progress", 0.0) or 0.0),
                 int((row or {}).get("id", 0) or 0),
             )
         )
+        random.shuffle(shared)
+        candidates = dedicated + shared
         for row in candidates:
             target_id = int(row["id"])
             current = cluster_leases.get(target_id)
@@ -4508,6 +4958,12 @@ def normalize_target_item(item, require_id=False):
     output["port_mode"] = port_config["port_mode"]
     output["port_start"] = port_config["port_start"]
     output["port_end"] = port_config["port_end"]
+    agent_config = normalize_target_agent_config(output)
+    if agent_config["agent_mode"] not in TARGET_AGENT_MODES:
+        allowed = ", ".join(sorted(TARGET_AGENT_MODES))
+        raise ValueError(f"Invalid agent_mode. Use {allowed}")
+    output["agent_mode"] = agent_config["agent_mode"]
+    output["agent_id"] = agent_config["agent_id"]
 
     return output
 
@@ -4710,6 +5166,113 @@ def build_dashboard(example=False):
             "summary": attacks_summary,
         },
         "cluster": cluster_snapshot,
+    }
+
+
+def _normalize_agent_status_target(row):
+    item = dict(row or {})
+    try:
+        target_id = int(item.get("id", 0) or 0)
+    except Exception:
+        target_id = 0
+    status = str(item.get("status", "") or "").strip().lower()
+    if status not in TARGET_STATUSES:
+        status = "active"
+    progress = _safe_float_value(item.get("progress"), default=0.0)
+    if progress < 0.0:
+        progress = 0.0
+    if progress > 100.0:
+        progress = 100.0
+    return {
+        "id": target_id,
+        "network": str(item.get("network", "") or "").strip(),
+        "proto": str(item.get("proto", "") or "").strip().lower(),
+        "type": str(item.get("type", "") or "").strip().lower(),
+        "status": status,
+        "progress": round(progress, 2),
+        "updated_at": str(item.get("updated_at", "") or "").strip(),
+        "created_at": str(item.get("created_at", "") or "").strip(),
+    }
+
+
+def build_agent_status_snapshot():
+    now_ts = time.time()
+    with _agent_mode_runtime_lock:
+        runtime_thread = _agent_mode_runtime_thread
+        runtime_started_at = float(_agent_mode_runtime_started_at or 0.0)
+        runtime_error = str(_agent_mode_runtime_last_error or "").strip()
+        runtime_obj = _agent_mode_runtime
+
+    runtime_alive = bool(runtime_thread is not None and runtime_thread.is_alive())
+    runtime_name = str(getattr(runtime_thread, "name", "") or "").strip()
+    agent_id = str(getattr(settings, "AGENT_ID", "") or "").strip()
+    master_url = str(getattr(settings, "PORTHOUND_MASTER", "") or "").strip()
+    if runtime_obj is not None:
+        agent_id = str(getattr(runtime_obj, "agent_id", agent_id) or agent_id).strip()
+        master_url = str(getattr(runtime_obj, "master_base_url", master_url) or master_url).strip()
+
+    try:
+        targets_raw = list(scan_db.select_targets() or [])
+    except Exception:
+        targets_raw = []
+    targets = [_normalize_agent_status_target(row) for row in targets_raw]
+    targets.sort(
+        key=lambda row: (
+            str((row or {}).get("updated_at", "") or ""),
+            int((row or {}).get("id", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    status_counter = Counter()
+    for row in targets:
+        status_counter[str((row or {}).get("status", "active"))] += 1
+    active_rows = [
+        row
+        for row in targets
+        if str((row or {}).get("status", "")).strip().lower() in {"active", "restarting"}
+    ]
+    current_task = active_rows[0] if active_rows else (targets[0] if targets else None)
+
+    try:
+        ports_count = int(scan_db.count_ports() or 0)
+    except Exception:
+        ports_count = 0
+    try:
+        banners_count = int(scan_db.count_banners() or 0)
+    except Exception:
+        banners_count = 0
+
+    return {
+        "generated_at": utc_iso(int(now_ts)),
+        "role": current_role(),
+        "web": {
+            "host": str(getattr(settings, "HOST", "") or "").strip(),
+            "port": int(getattr(settings, "PORT", 0) or 0),
+            "db_path": str(getattr(settings, "SCAN_DB_PATH", "") or "").strip(),
+        },
+        "agent": {
+            "agent_id": agent_id,
+            "master": master_url,
+            "poll_seconds": int(getattr(settings, "AGENT_POLL_SECONDS", 8) or 8),
+            "http_timeout": float(getattr(settings, "AGENT_HTTP_TIMEOUT", 20.0) or 20.0),
+        },
+        "agent_runtime": {
+            "alive": runtime_alive,
+            "thread_name": runtime_name,
+            "started_at": utc_iso(int(runtime_started_at)) if runtime_started_at > 0 else "",
+            "last_error": runtime_error,
+        },
+        "summary": {
+            "targets_total": len(targets),
+            "active": int(status_counter.get("active", 0)),
+            "restarting": int(status_counter.get("restarting", 0)),
+            "stopped": int(status_counter.get("stopped", 0)),
+            "ports": ports_count,
+            "banners": banners_count,
+        },
+        "current_task": current_task,
+        "targets": targets[:50],
     }
 
 
@@ -4958,6 +5521,11 @@ def build_chart_analytics(example=False):
 
 @app.view("/")
 def root_view(request):
+    role = current_role()
+    if role == "agent":
+        if wants_html(request):
+            return Response.html(AGENT_STATUS_HTML)
+        return Response.json(build_agent_status_snapshot())
     if is_example(request):
         return Response.json(example_counts())
     if wants_html(request):
@@ -5598,6 +6166,9 @@ def build_example_ip_intel_payload(ip_value):
 @app.api("/api/ip/domains/", methods=["GET"])
 def api_ip_domains(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             example_payload = build_example_ip_intel_payload(ip_value)
@@ -5623,6 +6194,9 @@ def api_ip_domains(request):
 @app.api("/api/ip/ttl-path/", methods=["GET"])
 def api_ip_ttl_path(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             return {
@@ -5660,6 +6234,9 @@ def api_ip_ttl_path(request):
 @app.api("/api/ip/intel/", methods=["GET"])
 def api_ip_intel(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             return build_example_ip_intel_payload(ip_value)
@@ -5699,6 +6276,122 @@ def _catalog_exception_response(exc):
             return json_error(message, status=404)
         return json_error(message, status=400)
     return json_error(exc, status=500)
+
+
+@app.api("/api/catalog/file/banner-rules", methods=["GET", "POST"])
+def api_catalog_file_banner_rules(request):
+    try:
+        if request.method == "GET":
+            _, rows = _read_catalog_file(DEFAULT_BANNER_RULES_FILE, "rules")
+            return {"datas": rows}
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        normalized = scan_db._normalize_banner_regex_row(payload, require_id=False)
+        _, rows = _read_catalog_file(DEFAULT_BANNER_RULES_FILE, "rules")
+        rule_key = str(normalized.get("rule_key", "") or "").strip()
+        rule_id = str(normalized.get("rule_id", "") or "").strip()
+        for row in rows:
+            if str((row or {}).get("rule_key", "")).strip() == rule_key:
+                raise ValueError("Duplicate rule_key in file catalog")
+            if rule_id and str((row or {}).get("id", row.get("rule_id", ""))).strip() == rule_id:
+                raise ValueError("Duplicate rule_id in file catalog")
+        file_row = {
+            "id": normalized["rule_id"],
+            "rule_key": rule_key,
+            "label": normalized["label"],
+            "pattern": normalized["pattern"],
+            "flags": int(normalized["flags"]),
+            "category": normalized["category"],
+            "service": normalized["service"],
+            "protocol": normalized["protocol"],
+            "product": normalized["product"],
+            "server": normalized["server"],
+            "os": normalized["os"],
+            "version": normalized["version"],
+            "runtime": normalized["runtime"],
+            "framework": normalized["framework"],
+            "vendor": normalized["vendor"],
+            "powered_by": normalized["powered_by"],
+            "active": bool(normalized["active"]),
+        }
+        rows.append(file_row)
+        _write_catalog_file(DEFAULT_BANNER_RULES_FILE, "rules", rows)
+        stored = scan_db.insert_banner_regex_rule_seed(file_row, source="file")
+        return {"status": "ok", "data": stored}
+    except Exception as exc:
+        return _catalog_exception_response(exc)
+
+
+@app.api("/api/catalog/file/banner-requests", methods=["GET", "POST"])
+def api_catalog_file_banner_requests(request):
+    try:
+        if request.method == "GET":
+            _, rows = _read_catalog_file(DEFAULT_BANNER_REQUESTS_FILE, "requests")
+            return {"datas": rows}
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        normalized = scan_db._normalize_banner_probe_row(payload, require_id=False)
+        _, rows = _read_catalog_file(DEFAULT_BANNER_REQUESTS_FILE, "requests")
+        request_key = str(normalized.get("request_key", "") or "").strip()
+        for row in rows:
+            if str((row or {}).get("request_key", "")).strip() == request_key:
+                raise ValueError("Duplicate request_key in file catalog")
+        file_row = {
+            "request_key": request_key,
+            "name": normalized["name"],
+            "proto": normalized["proto"],
+            "scope": normalized["scope"],
+            "port": int(normalized["port"]),
+            "payload_format": normalized["payload_format"],
+            "payload_encoded": normalized["payload_encoded"],
+            "description": normalized["description"],
+            "active": bool(normalized["active"]),
+        }
+        rows.append(file_row)
+        _write_catalog_file(DEFAULT_BANNER_REQUESTS_FILE, "requests", rows)
+        stored = scan_db.insert_banner_probe_request_seed(file_row, source="file")
+        return {"status": "ok", "data": stored}
+    except Exception as exc:
+        return _catalog_exception_response(exc)
+
+
+@app.api("/api/catalog/file/ip-presets", methods=["GET", "POST"])
+def api_catalog_file_ip_presets(request):
+    try:
+        if request.method == "GET":
+            _, rows = _read_catalog_file(DEFAULT_IP_PRESETS_FILE, "ips")
+            return {"datas": rows}
+
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
+        payload = request.json() or {}
+        normalized_value = _normalize_ip_value(payload.get("value", ""))
+        label = str(payload.get("label", "") or "").strip()
+        description = str(payload.get("description", "") or "")
+        active = bool(payload.get("active", True))
+        _, rows = _read_catalog_file(DEFAULT_IP_PRESETS_FILE, "ips")
+        for row in rows:
+            if str((row or {}).get("value", "")).strip() == normalized_value:
+                raise ValueError("Duplicate value in file catalog")
+        file_row = {
+            "value": normalized_value,
+            "label": label,
+            "description": description,
+            "active": active,
+        }
+        rows.append(file_row)
+        _write_catalog_file(DEFAULT_IP_PRESETS_FILE, "ips", rows)
+        stored = scan_db.insert_ip_preset_seed(file_row, source="file")
+        return {"status": "ok", "data": stored}
+    except Exception as exc:
+        return _catalog_exception_response(exc)
 
 
 @app.api("/api/catalog/banner-rules/", methods=["GET", "POST", "PUT", "DELETE"])
@@ -5985,6 +6678,12 @@ def api_chat_clear(request):
     return {"status": "ok", "deleted": deleted}
 
 
+@app.api("/api/agent/status", methods=["GET"])
+def api_agent_status(request):
+    _ = request
+    return build_agent_status_snapshot()
+
+
 @app.api("/api/cluster/agents", methods=["GET"])
 def api_cluster_agents(request):
     if not is_master_role():
@@ -6191,6 +6890,18 @@ def api_cluster_agent_heartbeat(request):
 
     task_id = str(payload.get("task_id", "") or "").strip()
     target_id_raw = payload.get("master_target_id")
+    stored = {"ports": 0, "tags": 0, "banners": 0, "favicons": 0}
+    try:
+        progress_value = float(payload.get("progress", 0.0) or 0.0)
+    except Exception:
+        progress_value = 0.0
+    if progress_value < 0.0:
+        progress_value = 0.0
+    if progress_value > 100.0:
+        progress_value = 100.0
+    heartbeat_result = payload.get("result", {})
+    if not isinstance(heartbeat_result, dict):
+        heartbeat_result = {}
     lease_renewed = False
     if task_id and target_id_raw not in (None, ""):
         lease_renewed = bool(
@@ -6217,6 +6928,9 @@ def api_cluster_agent_heartbeat(request):
             release_task_lease(target_id, task_id=task_id, agent_id=agent_id)
         else:
             target_exists = True
+            scan_db.set_target_progress(data={"id": target_id, "progress": progress_value})
+            if heartbeat_result:
+                stored = _merge_agent_results(heartbeat_result, agent_id=agent_id)
             target_status = str(target_row.get("status", "")).strip().lower()
             if target_status == "stopped":
                 desired_action = "stop"
@@ -6235,6 +6949,8 @@ def api_cluster_agent_heartbeat(request):
         "desired_action": desired_action,
         "target_status": target_status,
         "target_exists": target_exists,
+        "progress": round(progress_value, 2),
+        "stored": stored,
     }
 
 
@@ -6589,10 +7305,25 @@ def run_master_mode(enable_local_scanners=False):
     return master_run_master_mode(enable_local_scanners=enable_local_scanners)
 
 
-def run_agent_mode():
+def run_agent_worker_mode():
     from agent import run_agent_mode as agent_run_agent_mode
 
     return agent_run_agent_mode(db=scan_db)
+
+
+def run_agent_mode():
+    start_geoip_blocks_db()
+    start_scanners()
+    start_agent_runtime_background()
+    if not str(getattr(settings, "API_TOKEN", "") or "").strip():
+        bind_host = str(getattr(settings, "HOST", "") or "").strip().lower()
+        if bind_host not in {"127.0.0.1", "localhost", "::1"}:
+            print(
+                "[security] PORTHOUND_API_TOKEN is not set. "
+                "Admin endpoints are restricted to loopback clients."
+            )
+    print(f"[bootstrap] role=agent host={settings.HOST} port={settings.PORT}")
+    app.run(settings.HOST, settings.PORT, ssl_context=None)
 
 
 def main():

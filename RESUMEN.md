@@ -57,10 +57,9 @@ Tablas principales:
 
 - `README.md` -> guia principal y flujo completo.
 - `FAST.md` -> arranque local rapido.
-- `FAST_DOCKER.md` -> arranque rapido con GHCR + Docker.
 - `API.md` -> referencia de endpoints actual.
 - `ARCHITECTURE.md` -> descripcion de componentes.
-- `DEPLOYMENT.md` -> despliegue local/GHCR/systemd.
+- `DEPLOYMENT.md` -> despliegue local, APT/ZIP y systemd.
 - `INSTALL.md` + `GETTING_STARTED.md` -> instalacion y primer uso.
 - `docs/` -> notas tecnicas por modulo.
 

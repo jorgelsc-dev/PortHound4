@@ -1,23 +1,23 @@
 <template>
   <div>
     <ViewHeader
-      overline="Catalog"
-      title="Scanner Catalog Manager"
-      description="Manage regex extraction rules, banner probe requests, and IP presets."
+      overline="Seed Files"
+      title="File-backed Catalog"
+      description="Manage immutable catalog data stored in JSON files (seeded at startup)."
       :refresh-loading="loadingAny"
       @refresh="loadAll"
     />
 
     <v-tabs v-model="tab" color="primary" class="mb-4">
-      <v-tab value="rules">Regex Rules</v-tab>
-      <v-tab value="requests">Banner Requests</v-tab>
-      <v-tab value="ips">IP Presets</v-tab>
+      <v-tab value="rules">Regex Rules File</v-tab>
+      <v-tab value="requests">Banner Requests File</v-tab>
+      <v-tab value="ips">IP Presets File</v-tab>
     </v-tabs>
 
     <DataPanel
       v-if="tab === 'rules'"
-      title="Banner Regex Rules"
-      subtitle="Built-in rules are read-only. Custom rules can be edited and deleted."
+      title="Banner Regex Rules (File)"
+      subtitle="Entries here are loaded from JSON files and remain immutable in the DB."
       :loading="loadingRules"
       :error="rulesError"
       :last-updated="lastUpdatedRules"
@@ -66,23 +66,14 @@
               :disabled="loadingRules || savingRule"
             />
           </v-col>
-          <v-col cols="12" md="2" class="d-flex align-center ga-2">
+          <v-col cols="12" md="2" class="d-flex align-center">
             <v-btn
               color="primary"
               type="submit"
               :loading="savingRule"
               :disabled="loadingRules"
             >
-              {{ ruleForm.id ? "Update" : "Add" }}
-            </v-btn>
-            <v-btn
-              v-if="ruleForm.id"
-              variant="text"
-              color="warning"
-              :disabled="loadingRules || savingRule"
-              @click="resetRuleForm"
-            >
-              Cancel
+              Add to File
             </v-btn>
           </v-col>
         </v-row>
@@ -139,8 +130,8 @@
 
     <EntityTablePanel
       v-if="tab === 'rules'"
-      title="Regex Rules"
-      subtitle="Entries loaded from file are immutable."
+      title="Rules in File"
+      subtitle="File entries are immutable in the DB."
       :rows="filteredRules"
       :columns="ruleColumns"
       :loading="loadingRules"
@@ -150,47 +141,15 @@
       empty-text="No regex rules found"
       @refresh="loadRules"
     >
-      <template #cell-source="{ item }">
-        <v-chip size="x-small" :color="item.mutable ? 'primary' : 'grey'" variant="tonal">
-          {{ item.source || (item.mutable ? "user" : "builtin") }}
-        </v-chip>
-      </template>
-      <template #cell-active="{ value }">
-        <v-chip size="x-small" :color="value ? 'success' : 'warning'" variant="tonal">
-          {{ value ? "yes" : "no" }}
-        </v-chip>
-      </template>
       <template #cell-pattern="{ value }">
         <span class="mono-clamp">{{ value }}</span>
-      </template>
-      <template #cell-actions="{ item }">
-        <div class="row-actions">
-          <v-btn
-            size="x-small"
-            color="info"
-            variant="tonal"
-            :disabled="!item.mutable || loadingRules || savingRule"
-            @click="startEditRule(item)"
-          >
-            Edit
-          </v-btn>
-          <v-btn
-            size="x-small"
-            color="error"
-            variant="tonal"
-            :disabled="!item.mutable || loadingRules || savingRule"
-            @click="deleteRule(item)"
-          >
-            Delete
-          </v-btn>
-        </div>
       </template>
     </EntityTablePanel>
 
     <DataPanel
       v-if="tab === 'requests'"
-      title="Banner Probe Requests"
-      subtitle="Manage TCP/UDP requests used by banner workers."
+      title="Banner Probe Requests (File)"
+      subtitle="Add new probe requests to the seed JSON file."
       :loading="loadingRequests"
       :error="requestsError"
       :last-updated="lastUpdatedRequests"
@@ -227,7 +186,6 @@
               label="Port"
               type="number"
               min="0"
-              max="65535"
               :disabled="loadingRequests || savingRequest || requestForm.scope !== 'port_override'"
               variant="outlined"
               density="comfortable"
@@ -278,29 +236,15 @@
           v-model="requestForm.payload_encoded"
           label="Payload"
           placeholder="Raw text, hex, or base64 depending on payload format"
-          rows="4"
+          rows="3"
           auto-grow
           :disabled="loadingRequests || savingRequest"
           variant="outlined"
           density="comfortable"
         />
-        <div class="d-flex align-center ga-2">
-          <v-btn
-            color="primary"
-            type="submit"
-            :loading="savingRequest"
-            :disabled="loadingRequests"
-          >
-            {{ requestForm.id ? "Update" : "Add" }}
-          </v-btn>
-          <v-btn
-            v-if="requestForm.id"
-            variant="text"
-            color="warning"
-            :disabled="loadingRequests || savingRequest"
-            @click="resetRequestForm"
-          >
-            Cancel
+        <div class="row-actions mt-2">
+          <v-btn color="primary" type="submit" :loading="savingRequest" :disabled="loadingRequests">
+            Add to File
           </v-btn>
         </div>
       </v-form>
@@ -308,8 +252,8 @@
 
     <EntityTablePanel
       v-if="tab === 'requests'"
-      title="Banner Requests"
-      subtitle="Custom requests are immediately used by new banner workers."
+      title="Requests in File"
+      subtitle="File entries are immutable in the DB."
       :rows="filteredRequests"
       :columns="requestColumns"
       :loading="loadingRequests"
@@ -318,48 +262,12 @@
       :live-refresh="true"
       empty-text="No banner requests found"
       @refresh="loadRequests"
-    >
-      <template #cell-source="{ item }">
-        <v-chip size="x-small" :color="item.mutable ? 'primary' : 'grey'" variant="tonal">
-          {{ item.source || (item.mutable ? "user" : "builtin") }}
-        </v-chip>
-      </template>
-      <template #cell-active="{ value }">
-        <v-chip size="x-small" :color="value ? 'success' : 'warning'" variant="tonal">
-          {{ value ? "yes" : "no" }}
-        </v-chip>
-      </template>
-      <template #cell-payload_preview="{ value }">
-        <span class="mono-clamp">{{ value }}</span>
-      </template>
-      <template #cell-actions="{ item }">
-        <div class="row-actions">
-          <v-btn
-            size="x-small"
-            color="info"
-            variant="tonal"
-            :disabled="!item.mutable || loadingRequests || savingRequest"
-            @click="startEditRequest(item)"
-          >
-            Edit
-          </v-btn>
-          <v-btn
-            size="x-small"
-            color="error"
-            variant="tonal"
-            :disabled="!item.mutable || loadingRequests || savingRequest"
-            @click="deleteRequest(item)"
-          >
-            Delete
-          </v-btn>
-        </div>
-      </template>
-    </EntityTablePanel>
+    />
 
     <DataPanel
       v-if="tab === 'ips'"
-      title="IP Presets"
-      subtitle="Store reusable IPv4 or CIDR values."
+      title="IP Presets (File)"
+      subtitle="Add new IP presets to the seed JSON file."
       :loading="loadingIps"
       :error="ipsError"
       :last-updated="lastUpdatedIps"
@@ -406,23 +314,9 @@
             />
           </v-col>
         </v-row>
-        <div class="d-flex align-center ga-2">
-          <v-btn
-            color="primary"
-            type="submit"
-            :loading="savingIp"
-            :disabled="loadingIps"
-          >
-            {{ ipForm.id ? "Update" : "Add" }}
-          </v-btn>
-          <v-btn
-            v-if="ipForm.id"
-            variant="text"
-            color="warning"
-            :disabled="loadingIps || savingIp"
-            @click="resetIpForm"
-          >
-            Cancel
+        <div class="row-actions mt-2">
+          <v-btn color="primary" type="submit" :loading="savingIp" :disabled="loadingIps">
+            Add to File
           </v-btn>
         </div>
       </v-form>
@@ -430,8 +324,8 @@
 
     <EntityTablePanel
       v-if="tab === 'ips'"
-      title="IP Presets"
-      subtitle="Built-in presets are read-only."
+      title="IP Presets in File"
+      subtitle="File entries are immutable in the DB."
       :rows="filteredIps"
       :columns="ipColumns"
       :loading="loadingIps"
@@ -440,40 +334,7 @@
       :live-refresh="true"
       empty-text="No IP presets found"
       @refresh="loadIps"
-    >
-      <template #cell-source="{ item }">
-        <v-chip size="x-small" :color="item.mutable ? 'primary' : 'grey'" variant="tonal">
-          {{ item.source || (item.mutable ? "user" : "builtin") }}
-        </v-chip>
-      </template>
-      <template #cell-active="{ value }">
-        <v-chip size="x-small" :color="value ? 'success' : 'warning'" variant="tonal">
-          {{ value ? "yes" : "no" }}
-        </v-chip>
-      </template>
-      <template #cell-actions="{ item }">
-        <div class="row-actions">
-          <v-btn
-            size="x-small"
-            color="info"
-            variant="tonal"
-            :disabled="!item.mutable || loadingIps || savingIp"
-            @click="startEditIp(item)"
-          >
-            Edit
-          </v-btn>
-          <v-btn
-            size="x-small"
-            color="error"
-            variant="tonal"
-            :disabled="!item.mutable || loadingIps || savingIp"
-            @click="deleteIp(item)"
-          >
-            Delete
-          </v-btn>
-        </div>
-      </template>
-    </EntityTablePanel>
+    />
   </div>
 </template>
 
@@ -483,47 +344,38 @@ import ViewHeader from "../components/ui/ViewHeader.vue";
 import DataPanel from "../components/ui/DataPanel.vue";
 import EntityTablePanel from "../components/ui/EntityTablePanel.vue";
 
-function defaultRuleForm() {
-  return {
-    id: null,
-    rule_id: "",
-    label: "",
-    pattern: "",
-    flags: 0,
-    category: "",
-    service: "",
-    protocol: "",
-    product: "",
-    active: true,
-  };
-}
+const defaultRuleForm = () => ({
+  rule_id: "",
+  label: "",
+  pattern: "",
+  flags: 0,
+  category: "",
+  service: "",
+  protocol: "",
+  product: "",
+  active: true,
+});
 
-function defaultRequestForm() {
-  return {
-    id: null,
-    name: "",
-    proto: "tcp",
-    scope: "generic",
-    port: 0,
-    payload_format: "text",
-    payload_encoded: "",
-    description: "",
-    active: true,
-  };
-}
+const defaultRequestForm = () => ({
+  name: "",
+  proto: "tcp",
+  scope: "generic",
+  port: 0,
+  payload_format: "text",
+  payload_encoded: "",
+  description: "",
+  active: true,
+});
 
-function defaultIpForm() {
-  return {
-    id: null,
-    value: "",
-    label: "",
-    description: "",
-    active: true,
-  };
-}
+const defaultIpForm = () => ({
+  value: "",
+  label: "",
+  description: "",
+  active: true,
+});
 
 export default {
-  name: "CatalogView",
+  name: "FileCatalogView",
   components: {
     ViewHeader,
     DataPanel,
@@ -554,72 +406,57 @@ export default {
       ipForm: defaultIpForm(),
       ruleColumns: [
         { key: "id", label: "ID" },
-        { key: "rule_id", label: "Rule ID" },
         { key: "label", label: "Label" },
         { key: "pattern", label: "Pattern" },
-        { key: "source", label: "Source" },
+        { key: "category", label: "Category" },
+        { key: "service", label: "Service" },
+        { key: "protocol", label: "Protocol" },
         { key: "active", label: "Active" },
-        { key: "actions", label: "Actions" },
       ],
       requestColumns: [
-        { key: "id", label: "ID" },
+        { key: "request_key", label: "Key" },
+        { key: "name", label: "Name" },
         { key: "proto", label: "Proto" },
         { key: "scope", label: "Scope" },
         { key: "port", label: "Port" },
-        { key: "name", label: "Name" },
-        { key: "payload_preview", label: "Payload Preview" },
-        { key: "source", label: "Source" },
+        { key: "payload_format", label: "Format" },
         { key: "active", label: "Active" },
-        { key: "actions", label: "Actions" },
       ],
       ipColumns: [
-        { key: "id", label: "ID" },
         { key: "value", label: "Value" },
         { key: "label", label: "Label" },
         { key: "description", label: "Description" },
-        { key: "source", label: "Source" },
         { key: "active", label: "Active" },
-        { key: "actions", label: "Actions" },
       ],
-      requestProtoItems: ["tcp", "udp"],
-      payloadFormatItems: ["text", "hex", "base64"],
     };
   },
   computed: {
-    apiBase() {
-      return this.store.state.apiBase;
-    },
     loadingAny() {
       return this.loadingRules || this.loadingRequests || this.loadingIps;
     },
+    requestProtoItems() {
+      return ["tcp", "udp"];
+    },
+    payloadFormatItems() {
+      return ["text", "hex", "base64"];
+    },
     requestScopeItems() {
-      if (this.requestForm.proto === "udp") {
-        return [
-          { label: "Generic", value: "generic" },
-          { label: "Port Override", value: "port_override" },
-        ];
-      }
-      return [
-        { label: "Generic", value: "generic" },
-        { label: "HTTP", value: "http" },
-        { label: "Port Override", value: "port_override" },
-      ];
+      return this.requestForm.proto === "udp"
+        ? [
+            { label: "Generic", value: "generic" },
+            { label: "Port Override", value: "port_override" },
+          ]
+        : [
+            { label: "Generic", value: "generic" },
+            { label: "HTTP", value: "http" },
+            { label: "Port Override", value: "port_override" },
+          ];
     },
     filteredRules() {
       const q = String(this.search || "").trim().toLowerCase();
       if (!q) return this.rules;
       return this.rules.filter((item) => {
-        const text = [
-          item.id,
-          item.rule_id,
-          item.label,
-          item.pattern,
-          item.category,
-          item.service,
-          item.protocol,
-          item.product,
-          item.source,
-        ]
+        const text = [item.id, item.label, item.pattern, item.category, item.service, item.protocol]
           .map((value) => String(value == null ? "" : value).toLowerCase())
           .join(" ");
         return text.includes(q);
@@ -629,16 +466,7 @@ export default {
       const q = String(this.search || "").trim().toLowerCase();
       if (!q) return this.requests;
       return this.requests.filter((item) => {
-        const text = [
-          item.id,
-          item.name,
-          item.proto,
-          item.scope,
-          item.port,
-          item.payload_preview,
-          item.description,
-          item.source,
-        ]
+        const text = [item.request_key, item.name, item.proto, item.scope, item.port, item.payload_format]
           .map((value) => String(value == null ? "" : value).toLowerCase())
           .join(" ");
         return text.includes(q);
@@ -648,32 +476,11 @@ export default {
       const q = String(this.search || "").trim().toLowerCase();
       if (!q) return this.ips;
       return this.ips.filter((item) => {
-        const text = [
-          item.id,
-          item.value,
-          item.label,
-          item.description,
-          item.source,
-        ]
+        const text = [item.value, item.label, item.description]
           .map((value) => String(value == null ? "" : value).toLowerCase())
           .join(" ");
         return text.includes(q);
       });
-    },
-  },
-  watch: {
-    apiBase() {
-      this.loadAll();
-    },
-    "requestForm.proto"(value) {
-      if (value === "udp" && this.requestForm.scope === "http") {
-        this.requestForm.scope = "generic";
-      }
-    },
-    "requestForm.scope"(value) {
-      if (value !== "port_override") {
-        this.requestForm.port = 0;
-      }
     },
   },
   mounted() {
@@ -686,13 +493,13 @@ export default {
     loadRules() {
       this.loadingRules = true;
       this.rulesError = "";
-      return this.store.fetchJsonPromise("/api/catalog/banner-rules/")
+      return this.store.fetchJsonPromise("/api/catalog/file/banner-rules")
         .then((payload) => {
           this.rules = this.store.extractArray(payload);
           this.lastUpdatedRules = new Date().toLocaleTimeString();
         })
         .catch((err) => {
-          this.rulesError = err.message || "Failed to load regex rules";
+          this.rulesError = err.message || "Failed to load file rules";
           this.lastUpdatedRules = "";
         })
         .finally(() => {
@@ -702,13 +509,13 @@ export default {
     loadRequests() {
       this.loadingRequests = true;
       this.requestsError = "";
-      return this.store.fetchJsonPromise("/api/catalog/banner-requests/")
+      return this.store.fetchJsonPromise("/api/catalog/file/banner-requests")
         .then((payload) => {
           this.requests = this.store.extractArray(payload);
           this.lastUpdatedRequests = new Date().toLocaleTimeString();
         })
         .catch((err) => {
-          this.requestsError = err.message || "Failed to load banner requests";
+          this.requestsError = err.message || "Failed to load file requests";
           this.lastUpdatedRequests = "";
         })
         .finally(() => {
@@ -718,44 +525,23 @@ export default {
     loadIps() {
       this.loadingIps = true;
       this.ipsError = "";
-      return this.store.fetchJsonPromise("/api/catalog/ip-presets/")
+      return this.store.fetchJsonPromise("/api/catalog/file/ip-presets")
         .then((payload) => {
           this.ips = this.store.extractArray(payload);
           this.lastUpdatedIps = new Date().toLocaleTimeString();
         })
         .catch((err) => {
-          this.ipsError = err.message || "Failed to load IP presets";
+          this.ipsError = err.message || "Failed to load file IP presets";
           this.lastUpdatedIps = "";
         })
         .finally(() => {
           this.loadingIps = false;
         });
     },
-    resetRuleForm() {
-      this.ruleForm = defaultRuleForm();
-    },
-    startEditRule(item) {
-      if (!item || !item.mutable) return;
-      this.ruleForm = {
-        id: item.id,
-        rule_id: item.rule_id || "",
-        label: item.label || "",
-        pattern: item.pattern || "",
-        flags: Number(item.flags || 0),
-        category: item.category || "",
-        service: item.service || "",
-        protocol: item.protocol || "",
-        product: item.product || "",
-        active: Boolean(item.active),
-      };
-      this.tab = "rules";
-    },
     submitRule() {
       this.savingRule = true;
       this.rulesError = "";
-      const method = this.ruleForm.id ? "PUT" : "POST";
       const payload = {
-        id: this.ruleForm.id,
         rule_id: this.ruleForm.rule_id,
         label: this.ruleForm.label,
         pattern: this.ruleForm.pattern,
@@ -766,65 +552,25 @@ export default {
         product: this.ruleForm.product,
         active: Boolean(this.ruleForm.active),
       };
-      return this.store.fetchJsonPromise("/api/catalog/banner-rules/", {
-        method,
+      return this.store.fetchJsonPromise("/api/catalog/file/banner-rules", {
+        method: "POST",
         body: JSON.stringify(payload),
       })
         .then(() => {
-          this.resetRuleForm();
+          this.ruleForm = defaultRuleForm();
           return this.loadRules();
         })
         .catch((err) => {
-          this.rulesError = err.message || "Failed to save regex rule";
+          this.rulesError = err.message || "Failed to append rule";
         })
         .finally(() => {
           this.savingRule = false;
         });
-    },
-    deleteRule(item) {
-      if (!item || !item.mutable) return;
-      if (!window.confirm(`Delete rule ${item.rule_id || item.id}?`)) return;
-      this.savingRule = true;
-      this.rulesError = "";
-      return this.store.fetchJsonPromise("/api/catalog/banner-rules/", {
-        method: "DELETE",
-        body: JSON.stringify({ id: item.id }),
-      })
-        .then(() => {
-          if (this.ruleForm.id === item.id) this.resetRuleForm();
-          return this.loadRules();
-        })
-        .catch((err) => {
-          this.rulesError = err.message || "Failed to delete regex rule";
-        })
-        .finally(() => {
-          this.savingRule = false;
-        });
-    },
-    resetRequestForm() {
-      this.requestForm = defaultRequestForm();
-    },
-    startEditRequest(item) {
-      if (!item || !item.mutable) return;
-      this.requestForm = {
-        id: item.id,
-        name: item.name || "",
-        proto: item.proto || "tcp",
-        scope: item.scope || "generic",
-        port: Number(item.port || 0),
-        payload_format: item.payload_format || "text",
-        payload_encoded: item.payload_encoded || "",
-        description: item.description || "",
-        active: Boolean(item.active),
-      };
-      this.tab = "requests";
     },
     submitRequest() {
       this.savingRequest = true;
       this.requestsError = "";
-      const method = this.requestForm.id ? "PUT" : "POST";
       const payload = {
-        id: this.requestForm.id,
         name: this.requestForm.name,
         proto: this.requestForm.proto,
         scope: this.requestForm.scope,
@@ -834,96 +580,40 @@ export default {
         description: this.requestForm.description,
         active: Boolean(this.requestForm.active),
       };
-      return this.store.fetchJsonPromise("/api/catalog/banner-requests/", {
-        method,
+      return this.store.fetchJsonPromise("/api/catalog/file/banner-requests", {
+        method: "POST",
         body: JSON.stringify(payload),
       })
         .then(() => {
-          this.resetRequestForm();
+          this.requestForm = defaultRequestForm();
           return this.loadRequests();
         })
         .catch((err) => {
-          this.requestsError = err.message || "Failed to save banner request";
+          this.requestsError = err.message || "Failed to append request";
         })
         .finally(() => {
           this.savingRequest = false;
         });
-    },
-    deleteRequest(item) {
-      if (!item || !item.mutable) return;
-      if (!window.confirm(`Delete request ${item.name || item.id}?`)) return;
-      this.savingRequest = true;
-      this.requestsError = "";
-      return this.store.fetchJsonPromise("/api/catalog/banner-requests/", {
-        method: "DELETE",
-        body: JSON.stringify({ id: item.id }),
-      })
-        .then(() => {
-          if (this.requestForm.id === item.id) this.resetRequestForm();
-          return this.loadRequests();
-        })
-        .catch((err) => {
-          this.requestsError = err.message || "Failed to delete banner request";
-        })
-        .finally(() => {
-          this.savingRequest = false;
-        });
-    },
-    resetIpForm() {
-      this.ipForm = defaultIpForm();
-    },
-    startEditIp(item) {
-      if (!item || !item.mutable) return;
-      this.ipForm = {
-        id: item.id,
-        value: item.value || "",
-        label: item.label || "",
-        description: item.description || "",
-        active: Boolean(item.active),
-      };
-      this.tab = "ips";
     },
     submitIp() {
       this.savingIp = true;
       this.ipsError = "";
-      const method = this.ipForm.id ? "PUT" : "POST";
       const payload = {
-        id: this.ipForm.id,
         value: this.ipForm.value,
         label: this.ipForm.label,
         description: this.ipForm.description,
         active: Boolean(this.ipForm.active),
       };
-      return this.store.fetchJsonPromise("/api/catalog/ip-presets/", {
-        method,
+      return this.store.fetchJsonPromise("/api/catalog/file/ip-presets", {
+        method: "POST",
         body: JSON.stringify(payload),
       })
         .then(() => {
-          this.resetIpForm();
+          this.ipForm = defaultIpForm();
           return this.loadIps();
         })
         .catch((err) => {
-          this.ipsError = err.message || "Failed to save IP preset";
-        })
-        .finally(() => {
-          this.savingIp = false;
-        });
-    },
-    deleteIp(item) {
-      if (!item || !item.mutable) return;
-      if (!window.confirm(`Delete IP preset ${item.value}?`)) return;
-      this.savingIp = true;
-      this.ipsError = "";
-      return this.store.fetchJsonPromise("/api/catalog/ip-presets/", {
-        method: "DELETE",
-        body: JSON.stringify({ id: item.id }),
-      })
-        .then(() => {
-          if (this.ipForm.id === item.id) this.resetIpForm();
-          return this.loadIps();
-        })
-        .catch((err) => {
-          this.ipsError = err.message || "Failed to delete IP preset";
+          this.ipsError = err.message || "Failed to append IP preset";
         })
         .finally(() => {
           this.savingIp = false;
@@ -936,7 +626,7 @@ export default {
 <style scoped>
 .row-actions {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 

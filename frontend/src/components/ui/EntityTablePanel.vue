@@ -6,6 +6,7 @@
     :error="error"
     :last-updated="lastUpdated"
     :show-refresh="showRefresh"
+    :live-refresh="liveRefresh"
     :refresh-label="refreshLabel"
     :variant="variant"
     @refresh="$emit('refresh')"
@@ -129,6 +130,10 @@ export default {
       default: "id",
     },
     showRefresh: {
+      type: Boolean,
+      default: false,
+    },
+    liveRefresh: {
       type: Boolean,
       default: false,
     },
