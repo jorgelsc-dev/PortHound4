@@ -332,6 +332,58 @@ class TestClusterSecurityHelpers(unittest.TestCase):
         )
         self.assertIsNone(app.require_agent_mtls(request_with_cert))
 
+    def test_require_admin_access_denies_untrusted_origin_on_loopback_without_token(self):
+        request = framework.Request(
+            method="POST",
+            path="/target/",
+            query_string="",
+            headers={"origin": "https://evil.example"},
+            body=b"{}",
+            client=("127.0.0.1", 0),
+        )
+        with mock.patch.object(app.settings, "API_TOKEN", ""), mock.patch.object(
+            app.settings, "API_REQUIRE_TOKEN", False
+        ):
+            deny = app.require_admin_access(request)
+        self.assertIsInstance(deny, framework.Response)
+        self.assertEqual(deny.status, 403)
+
+    def test_require_admin_access_allows_loopback_origin_on_loopback_without_token(self):
+        request = framework.Request(
+            method="POST",
+            path="/target/",
+            query_string="",
+            headers={"origin": "http://127.0.0.1:45678"},
+            body=b"{}",
+            client=("127.0.0.1", 0),
+        )
+        with mock.patch.object(app.settings, "API_TOKEN", ""), mock.patch.object(
+            app.settings, "API_REQUIRE_TOKEN", False
+        ):
+            self.assertIsNone(app.require_admin_access(request))
+
+    def test_ip_intel_routes_require_admin_access(self):
+        endpoints = (
+            (app.api_ip_domains, "/api/ip/domains/"),
+            (app.api_ip_ttl_path, "/api/ip/ttl-path/"),
+            (app.api_ip_intel, "/api/ip/intel/"),
+        )
+        with mock.patch.object(app.settings, "API_TOKEN", ""), mock.patch.object(
+            app.settings, "API_REQUIRE_TOKEN", False
+        ):
+            for handler, path in endpoints:
+                request = framework.Request(
+                    method="GET",
+                    path=path,
+                    query_string="ip=8.8.8.8",
+                    headers={},
+                    body=b"",
+                    client=("198.51.100.10", 0),
+                )
+                response = handler(request)
+                self.assertIsInstance(response, framework.Response)
+                self.assertEqual(response.status, 403)
+
     def test_ca_oneline_roundtrip(self):
         pem = (
             "-----BEGIN CERTIFICATE-----\n"

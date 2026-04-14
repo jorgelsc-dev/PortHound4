@@ -28,6 +28,12 @@ jobs:
           echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "name=${RELEASE_NAME}" >> "${GITHUB_OUTPUT}"
 
+      - name: Run unit tests
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest
+          pytest -q
+
       - name: Build Debian package
         run: ./packaging/deb/build.sh --output-dir dist/deb
 

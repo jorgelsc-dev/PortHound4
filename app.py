@@ -3,6 +3,7 @@ import mimetypes
 import random
 import sqlite3
 import re
+import hmac
 import errno
 import base64
 import socket
@@ -16,6 +17,7 @@ from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, ip_address, ip_network
 from pathlib import Path
+from urllib.parse import urlsplit
 import settings
 from framework import App, Response, Route, parse_close_payload
 
@@ -4259,13 +4261,37 @@ def _extract_request_token(request):
     return str(headers.get("x-api-key", "") or headers.get("X-API-Key", "")).strip()
 
 
+def _extract_request_origin(request):
+    headers = getattr(request, "headers", {}) or {}
+    return str(
+        headers.get("origin", "")
+        or headers.get("Origin", "")
+    ).strip()
+
+
+def _is_loopback_origin(origin):
+    raw_origin = str(origin or "").strip()
+    if not raw_origin:
+        return False
+    parsed = urlsplit(raw_origin)
+    if str(parsed.scheme or "").strip().lower() not in {"http", "https"}:
+        return False
+    host = str(parsed.hostname or "").strip()
+    if not host:
+        return False
+    try:
+        return ip_address(host).is_loopback
+    except Exception:
+        return host.lower() == "localhost"
+
+
 def require_admin_access(request):
     configured_token = str(getattr(settings, "API_TOKEN", "") or "").strip()
     require_token = bool(getattr(settings, "API_REQUIRE_TOKEN", False))
 
     if configured_token:
         provided_token = _extract_request_token(request)
-        if provided_token == configured_token:
+        if hmac.compare_digest(provided_token, configured_token):
             return None
         return json_error("Unauthorized", status=401)
 
@@ -4273,6 +4299,13 @@ def require_admin_access(request):
         return json_error("Unauthorized", status=401)
 
     if _is_loopback_client(request):
+        origin = _extract_request_origin(request)
+        if origin and not _is_loopback_origin(origin):
+            return json_error(
+                "Admin access denied for untrusted Origin on loopback. "
+                "Configure PORTHOUND_API_TOKEN.",
+                status=403,
+            )
         return None
     return json_error(
         "Admin access denied for non-loopback client. Configure PORTHOUND_API_TOKEN.",
@@ -6133,6 +6166,9 @@ def build_example_ip_intel_payload(ip_value):
 @app.api("/api/ip/domains/", methods=["GET"])
 def api_ip_domains(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             example_payload = build_example_ip_intel_payload(ip_value)
@@ -6158,6 +6194,9 @@ def api_ip_domains(request):
 @app.api("/api/ip/ttl-path/", methods=["GET"])
 def api_ip_ttl_path(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             return {
@@ -6195,6 +6234,9 @@ def api_ip_ttl_path(request):
 @app.api("/api/ip/intel/", methods=["GET"])
 def api_ip_intel(request):
     try:
+        admin_error = require_admin_access(request)
+        if admin_error:
+            return admin_error
         ip_value, refresh = parse_ip_intel_request(request)
         if is_example(request):
             return build_example_ip_intel_payload(ip_value)
