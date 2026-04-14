@@ -163,6 +163,39 @@ env/bin/python ws_demo.py  # Demo HTTP/WS
   - El agente ahora imprime progreso periodico en consola: `[agent] task progress ...`.
   - Puedes ajustar deteccion de estancamiento con `PORTHOUND_AGENT_TASK_STALL_SECONDS` (minimo 90, por defecto 300).
 
+### 5) Empaquetado (APT + ZIP)
+
+Paquete Debian (`.deb`) instalable con `apt`:
+
+```bash
+./packaging/deb/build.sh
+sudo apt install ./dist/deb/porthound4_<version>-1_all.deb
+```
+
+Paquete portable (`.zip`):
+
+```bash
+./packaging/zip/build.sh
+unzip dist/zip/porthound4_<version>-1.zip
+cd porthound4_<version>-1
+python3 manage.py
+```
+
+Comandos utiles (APT):
+
+```bash
+porthound4 --help
+sudo systemctl enable --now porthound4
+sudo systemctl status porthound4
+```
+
+Archivo de configuracion del servicio:
+- `/etc/default/porthound4`
+
+Release automatica en `main`:
+- publica `porthound4_<version>-<rev>_all.deb`
+- publica `porthound4_<version>-<rev>.zip`
+
 ---
 
 ## 🧩 Estructura del proyecto

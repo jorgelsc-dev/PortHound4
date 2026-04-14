@@ -5,32 +5,50 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
 
 permissions:
   contents: write
 
 jobs:
   github-release:
-    name: GitHub Release (source only)
+    name: GitHub Release (.deb + .zip)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Resolve release metadata
         id: release_meta
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
-            RELEASE_NAME="Release ${RELEASE_TAG}"
-          else
-            SHORT_SHA="${GITHUB_SHA::7}"
-            RELEASE_TAG="main-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
-            RELEASE_NAME="Main build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
-          fi
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RELEASE_TAG="main-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
+          RELEASE_NAME="Main build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
 
           echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "name=${RELEASE_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Debian package
+        run: ./packaging/deb/build.sh --output-dir dist/deb
+
+      - name: Build ZIP package
+        run: ./packaging/zip/build.sh --output-dir dist/zip
+
+      - name: Resolve release assets
+        id: assets
+        run: |
+          DEB_FILE="$(ls dist/deb/porthound4_*_*.deb | head -n1)"
+          ZIP_FILE="$(ls dist/zip/porthound4_*.zip | head -n1)"
+          if [[ -z "${DEB_FILE}" || -z "${ZIP_FILE}" ]]; then
+            echo "Release assets not found"
+            exit 1
+          fi
+          {
+            echo "files<<EOF"
+            echo "${DEB_FILE}"
+            echo "${ZIP_FILE}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -39,3 +57,4 @@ jobs:
           name: ${{ steps.release_meta.outputs.name }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          files: ${{ steps.assets.outputs.files }}

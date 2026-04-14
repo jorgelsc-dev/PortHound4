@@ -23,8 +23,9 @@
 - Modo explicito:
   - `python manage.py --role master --host 0.0.0.0 --port 45678 --db-path Master.db`
   - `python manage.py --role agent --master http://<MASTER_HOST>:45678 --agent-id <id> --agent-token <token>`
-- Flujo docker rapido:
-  - ver `FAST_DOCKER.md`
+- Empaquetado recomendado:
+  - `./packaging/deb/build.sh` (APT)
+  - `./packaging/zip/build.sh` (ZIP portable)
 
 ## API principal (`app.py`)
 - Core:
