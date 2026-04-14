@@ -4,9 +4,9 @@
   "private": true,
   "author": "",
   "scripts": {
-    "serve": "vue-cli-service serve",
-    "build": "vue-cli-service build",
-    "lint": "vue-cli-service lint",
+    "serve": "node ./scripts/vue-cli-safe.js serve",
+    "build": "node ./scripts/vue-cli-safe.js build",
+    "lint": "node ./scripts/vue-cli-safe.js lint",
     "test": "npm run lint"
   },
   "main": "index.js",

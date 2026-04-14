@@ -44,3 +44,7 @@ include-package-data = true
 "porthound/data" = ["data/**"]
 "porthound/docs" = ["docs/**"]
 "porthound/frontend" = ["frontend/dist/**"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

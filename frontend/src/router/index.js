@@ -11,6 +11,7 @@ import TagsView from "../views/TagsView.vue";
 import ChartsView from "../views/ChartsView.vue";
 import ApiView from "../views/ApiView.vue";
 import CatalogView from "../views/CatalogView.vue";
+import FileCatalogView from "../views/FileCatalogView.vue";
 
 const routes = [
   { path: "/", name: "dashboard", component: DashboardView },
@@ -23,6 +24,7 @@ const routes = [
   { path: "/banners", name: "banners", component: BannersView },
   { path: "/tags", name: "tags", component: TagsView },
   { path: "/catalog", name: "catalog", component: CatalogView },
+  { path: "/catalog-files", name: "catalog-files", component: FileCatalogView },
   { path: "/api", name: "api", component: ApiView },
 ];
 

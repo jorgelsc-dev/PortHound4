@@ -14,6 +14,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       @refresh="load"
     >
       <template #skeleton>
@@ -127,7 +128,7 @@
                   <td>{{ item.id }}</td>
                   <td>{{ item.ip }}</td>
                   <td>{{ item.port }}</td>
-                  <td>{{ item.state }}</td>
+                  <td :title="formatStateTooltip(item)">{{ formatStateLabel(item) }}</td>
                   <td>
                     <v-chip
                       size="x-small"
@@ -392,6 +393,25 @@ export default {
       if (status === "restarting") return "info";
       if (status === "stopped") return "warning";
       return "success";
+    },
+    formatStateLabel(row) {
+      const proto = String(row?.proto || "").trim().toLowerCase();
+      const state = String(row?.state || "").trim().toLowerCase();
+      if (!state) return "-";
+      if (proto === "icmp" && state === "filtered") return "no reply";
+      return state;
+    },
+    formatStateTooltip(row) {
+      const proto = String(row?.proto || "").trim().toLowerCase();
+      const state = String(row?.state || "").trim().toLowerCase();
+      if (!state) return "-";
+      if (proto === "icmp" && state === "filtered") {
+        return "ICMP echo reply was not received. The host may be down or a firewall may be dropping the probe.";
+      }
+      if (proto === "icmp" && state === "open") {
+        return "ICMP echo reply received.";
+      }
+      return state;
     },
     handleWsRefresh() {
       if (this.loading) return;

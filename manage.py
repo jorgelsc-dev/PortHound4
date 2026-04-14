@@ -15,6 +15,9 @@ from urllib.parse import urlsplit
 BOOL_CHOICES = ("0", "1", "false", "true", "no", "yes", "off", "on")
 TRUE_CHOICES = {"1", "true", "yes", "on", "y"}
 FALSE_CHOICES = {"0", "false", "no", "off", "n"}
+FIXED_WEB_HOST = "127.0.0.1"
+FIXED_WEB_MASTER_PORT = 45678
+FIXED_WEB_AGENT_PORT = 45677
 ROLE_DEFAULT_DB_PATHS = {
     "master": "Master.db",
     "agent": "Agent.db",
@@ -169,8 +172,16 @@ def parse_args():
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("master", "agent", "standalone"),
-        help="Quick launch mode. Example: `python manage.py agent`.",
+        help=(
+            "Optional enrollment payload (base64/JSON). "
+            "`python manage.py` => master, "
+            "`python manage.py <BASE64>` => agent."
+        ),
+    )
+    parser.add_argument(
+        "enroll_payload",
+        nargs="?",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--env-file",
@@ -225,10 +236,56 @@ def parse_args():
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Launch interactive onboarding prompts.",
+        help="Deprecated. Interactive onboarding is disabled and this flag is ignored.",
     )
 
     return parser.parse_args()
+
+
+def _apply_positional_mode_and_enroll(args):
+    raw_first = str(getattr(args, "mode", "") or "").strip()
+    raw_second = str(getattr(args, "enroll_payload", "") or "").strip()
+
+    explicit_role = bool(str(getattr(args, "role", "") or "").strip())
+    explicit_enroll = bool(str(getattr(args, "agent_enroll", "") or "").strip())
+
+    # Legacy compatibility: python manage.py <IGNORED> <BASE64>
+    if raw_second:
+        if not explicit_enroll:
+            args.agent_enroll = raw_second
+        if not explicit_role:
+            args.role = "agent"
+        print(
+            "[bootstrap] legacy positional format detected: "
+            "first positional token ignored, using second token as enroll payload."
+        )
+        return
+
+    if raw_first:
+        normalized_first = raw_first.lower()
+        # Backward compatibility for explicit role token in first positional.
+        if normalized_first in {"master", "agent", "standalone"}:
+            if not explicit_role:
+                args.role = normalized_first
+            return
+
+        # Preferred path: python manage.py <BASE64|JSON>
+        if not explicit_enroll:
+            args.agent_enroll = raw_first
+        if not explicit_role:
+            args.role = "agent"
+        return
+
+    # Form: python manage.py
+    if not explicit_role:
+        args.role = "master"
+
+
+def _fixed_web_port_for_role(role: str) -> int:
+    normalized = normalize_role(role)
+    if normalized == "agent":
+        return int(FIXED_WEB_AGENT_PORT)
+    return int(FIXED_WEB_MASTER_PORT)
 
 
 def _has_non_interactive_cli_overrides(argv=None):
@@ -243,6 +300,33 @@ def _has_non_interactive_cli_overrides(argv=None):
             continue
         return True
     return False
+
+
+def _enforce_fixed_web_port(args):
+    resolved_role = normalize_role(
+        str(getattr(args, "role", "") or "").strip()
+        or str(environ.get("PORTHOUND_ROLE", "master") or "").strip()
+        or "master"
+    )
+    fixed_port = _fixed_web_port_for_role(resolved_role)
+    requested_host = str(getattr(args, "host", "") or "").strip()
+    if requested_host and requested_host != FIXED_WEB_HOST:
+        print(
+            "[bootstrap] fixed host policy active: "
+            f"ignoring requested host '{requested_host}', using {FIXED_WEB_HOST}."
+        )
+    args.host = str(FIXED_WEB_HOST)
+    try:
+        requested_port = int(getattr(args, "port", 0) or 0)
+    except Exception:
+        requested_port = 0
+    if requested_port not in {0, int(fixed_port)}:
+        print(
+            "[bootstrap] fixed port policy active: "
+            f"ignoring requested port {requested_port}, "
+            f"using {fixed_port} for role '{resolved_role}'."
+        )
+    args.port = int(fixed_port)
 
 
 def strip_wrapping_quotes(value: str) -> str:
@@ -282,6 +366,46 @@ def normalize_role(raw: str) -> str:
 def default_db_path_for_role(role: str) -> str:
     normalized = normalize_role(role)
     return str(ROLE_DEFAULT_DB_PATHS.get(normalized, "Database.db"))
+
+
+def _detect_persisted_role_from_db_path(db_path: str, default_role="master") -> str:
+    preferred = normalize_role(default_role)
+    db_value = str(db_path or "").strip()
+    if not db_value:
+        return preferred
+    found_roles = []
+    for role in ("master", "agent", "standalone"):
+        profile = load_persisted_role_profile(role, db_value)
+        if profile_has_data(profile):
+            found_roles.append(role)
+    if not found_roles:
+        return preferred
+    if preferred in found_roles:
+        return preferred
+    return str(found_roles[0])
+
+
+def detect_persisted_bootstrap_role(default_role="master") -> str:
+    preferred = normalize_role(default_role)
+    db_override = str(environ.get("PORTHOUND_DB_PATH", "") or "").strip()
+    if db_override:
+        return _detect_persisted_role_from_db_path(
+            db_override,
+            default_role=preferred,
+        )
+
+    found_roles = []
+    for role in ("master", "agent", "standalone"):
+        db_path = default_db_path_for_role(role)
+        profile = load_persisted_role_profile(role, db_path)
+        if profile_has_data(profile):
+            found_roles.append(role)
+
+    if not found_roles:
+        return preferred
+    if preferred in found_roles:
+        return preferred
+    return str(found_roles[0])
 
 
 def resolve_effective_role(args) -> str:
@@ -869,8 +993,8 @@ def run_interactive_onboarding(args):
         args.db_path = default_db_path_for_role(role)
 
     if role in {"master", "standalone"}:
-        args.host = _prompt_text("IP", _env_or_arg(args, "host", "0.0.0.0"), required=True)
-        args.port = _prompt_int("Puerto", _env_or_arg(args, "port", "45678"), min_value=1, max_value=65535)
+        args.host = str(FIXED_WEB_HOST)
+        args.port = _fixed_web_port_for_role(role)
         if str(getattr(args, "db_path", "") or "").strip() == "":
             args.db_path = _env_or_arg(args, "db_path", default_db_path_for_role(role))
         args.tls_enabled = "0"
@@ -921,6 +1045,10 @@ def run_interactive_onboarding(args):
         args.agent_poll_seconds = int(_env_or_arg(args, "agent_poll_seconds", "8") or 8)
         args.agent_http_timeout = float(_env_or_arg(args, "agent_http_timeout", "20") or 20.0)
         args.agent_tls_check_hostname = "0"
+        args.host = str(FIXED_WEB_HOST)
+        args.port = _fixed_web_port_for_role(role)
+        if str(getattr(args, "db_path", "") or "").strip() == "":
+            args.db_path = _env_or_arg(args, "db_path", default_db_path_for_role(role))
 
 
 def _should_auto_interactive(
@@ -929,13 +1057,12 @@ def _should_auto_interactive(
     missing_required=None,
     has_non_interactive_cli_overrides=False,
 ):
+    _ = (has_profile, has_non_interactive_cli_overrides)
     if not _is_interactive_terminal() or bool(args.interactive):
         return False
     if list(missing_required or []):
         return True
-    if bool(has_non_interactive_cli_overrides):
-        return False
-    return True
+    return False
 
 
 def apply_cli_overrides(args):
@@ -961,21 +1088,24 @@ def apply_cli_overrides(args):
 
 def main():
     args = parse_args()
-    if not str(getattr(args, "role", "") or "").strip():
-        cli_mode = str(getattr(args, "mode", "") or "").strip().lower()
-        if cli_mode in {"master", "agent", "standalone"}:
-            args.role = cli_mode
+    _apply_positional_mode_and_enroll(args)
+    _enforce_fixed_web_port(args)
+    if bool(getattr(args, "interactive", False)):
+        print(
+            "[bootstrap] --interactive is deprecated and ignored. "
+            "Use CLI flags, env vars or enroll base64 payload."
+        )
     if str(getattr(args, "agent_enroll", "") or "").strip():
         payload = _load_agent_enroll_payload(args.agent_enroll)
         if payload:
             _apply_agent_enroll_payload(args, payload, allow_override=False)
         else:
             print("[bootstrap] invalid enrollment payload, ignoring.")
-    has_non_interactive_cli_overrides = _has_non_interactive_cli_overrides()
-    if args.interactive:
-        _preload_role_for_env_selection(args)
+    if not str(getattr(args, "role", "") or "").strip():
+        args.role = "master"
 
     load_env_fallbacks(args)
+    _enforce_fixed_web_port(args)
 
     initial_role = resolve_effective_role(args)
     if (
@@ -1003,20 +1133,17 @@ def main():
         args.db_path = resolve_effective_db_path(args, resolve_effective_role(args))
 
     missing_required = _missing_required_settings(args)
-    auto_interactive = _should_auto_interactive(
-        args,
-        has_profile=profile_has_data(persisted_profile),
-        missing_required=missing_required,
-        has_non_interactive_cli_overrides=has_non_interactive_cli_overrides,
-    )
-    if auto_interactive and missing_required:
+    if missing_required:
         print(
             "[bootstrap] missing settings detected: "
             + ", ".join(missing_required)
-            + ". Opening interactive setup."
+            + "."
         )
-    if args.interactive or auto_interactive:
-        run_interactive_onboarding(args)
+        print(
+            "[bootstrap] interactive onboarding is disabled. "
+            "Provide missing settings via flags, env vars or enroll payload."
+        )
+        raise SystemExit(2)
 
     final_role_hint = resolve_effective_role(args)
     if (
@@ -1025,6 +1152,7 @@ def main():
     ):
         args.db_path = default_db_path_for_role(final_role_hint)
 
+    _enforce_fixed_web_port(args)
     apply_cli_overrides(args)
     final_role = normalize_role(environ.get("PORTHOUND_ROLE", final_role_hint))
     final_db_path = (

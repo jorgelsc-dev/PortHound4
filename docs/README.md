@@ -9,4 +9,5 @@
 - INSTALL.md
 - GETTING_STARTED.md
 - FAST.md
-- FAST_DOCKER.md
+- packaging/deb/README.md
+- packaging/zip/README.md

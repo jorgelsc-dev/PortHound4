@@ -187,6 +187,8 @@ TARGET_TYPES = {"common", "not_common", "full"}
 TARGET_PROTOS = detect_target_protocols()
 TARGET_STATUSES = {"active", "stopped", "restarting"}
 TARGET_PORT_MODES = {"preset", "single", "range"}
+TARGET_AGENT_MODES = {"random", "local", "agent"}
+LOCAL_CLUSTER_AGENT_ID = "local"
 PORT_SCAN_STATUSES = {"active", "stopped", "restarting"}
 PORT_MIN = 1
 PORT_MAX = 65535
@@ -238,6 +240,34 @@ def normalize_target_port_config(item: dict, proto: str) -> dict:
         return output
 
     return output
+
+
+def normalize_target_agent_config(item: dict) -> dict:
+    data = item if isinstance(item, dict) else {}
+    mode_raw = (
+        data.get("agent_mode")
+        if "agent_mode" in data
+        else data.get("agent_selection", data.get("scan_agent_mode", "random"))
+    )
+    mode = str(mode_raw or "random").strip().lower()
+    if mode == "specific":
+        mode = "agent"
+    if mode not in TARGET_AGENT_MODES:
+        allowed = ", ".join(sorted(TARGET_AGENT_MODES))
+        raise ValueError(f"Invalid agent_mode. Use {allowed}")
+
+    agent_id_raw = str(
+        data.get("agent_id", data.get("target_agent_id", data.get("scan_agent_id", "")))
+        or ""
+    ).strip()
+    if mode == "local":
+        return {"agent_mode": "local", "agent_id": LOCAL_CLUSTER_AGENT_ID}
+    if mode == "agent":
+        return {
+            "agent_mode": "agent",
+            "agent_id": _normalize_agent_id(agent_id_raw, generate_if_missing=False),
+        }
+    return {"agent_mode": "random", "agent_id": ""}
 
 
 def resolve_target_ports(type_scan: str, port_mode="preset", port_start=None, port_end=None):
@@ -427,6 +457,8 @@ class DB(object):
                 "port_mode TEXT NOT NULL DEFAULT 'preset',"
                 "port_start INTEGER NOT NULL DEFAULT 0,"
                 "port_end INTEGER NOT NULL DEFAULT 0,"
+                "agent_mode TEXT NOT NULL DEFAULT 'random',"
+                "agent_id TEXT NOT NULL DEFAULT '',"
                 "timesleep REAL DEFAULT 1.0,"
                 "progress REAL DEFAULT 0.0,"
                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
@@ -512,6 +544,16 @@ class DB(object):
                     "ALTER TABLE targets "
                     "ADD COLUMN status TEXT NOT NULL DEFAULT 'active';"
                 )
+            if "agent_mode" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN agent_mode TEXT NOT NULL DEFAULT 'random';"
+                )
+            if "agent_id" not in target_columns:
+                cursor.execute(
+                    "ALTER TABLE targets "
+                    "ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';"
+                )
             cursor.execute(
                 "UPDATE targets "
                 "SET port_mode = 'preset' "
@@ -554,6 +596,29 @@ class DB(object):
                 "SET status = 'active' "
                 "WHERE status IS NULL OR trim(status) = '' "
                 "OR lower(status) NOT IN ('active', 'stopped', 'restarting');"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET agent_mode = 'random' "
+                "WHERE agent_mode IS NULL OR trim(agent_mode) = '' "
+                "OR lower(agent_mode) NOT IN ('random', 'local', 'agent');"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET agent_id = '' "
+                "WHERE lower(agent_mode) = 'random';"
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET agent_id = ? "
+                "WHERE lower(agent_mode) = 'local';",
+                (LOCAL_CLUSTER_AGENT_ID,),
+            )
+            cursor.execute(
+                "UPDATE targets "
+                "SET agent_mode = 'random', agent_id = '' "
+                "WHERE lower(agent_mode) = 'agent' "
+                "AND (agent_id IS NULL OR trim(agent_id) = '');"
             )
             cursor.execute("PRAGMA table_info(ports);")
             port_columns = {row[1] for row in cursor.fetchall()}
@@ -658,6 +723,7 @@ class DB(object):
 
     def _iter_builtin_banner_rules(self):
         rows = _safe_read_json_array(self.banner_rules_file, "rules")
+        source = "file" if rows else "builtin"
         if not rows:
             rows = list(BANNER_REGEX_RULES)
         output = []
@@ -693,6 +759,8 @@ class DB(object):
                     "framework": str(row.get("framework", "") or ""),
                     "vendor": str(row.get("vendor", "") or ""),
                     "powered_by": str(row.get("powered_by", "") or ""),
+                    "source": source,
+                    "mutable": 0,
                     "active": 1 if _parse_bool(row.get("active", True), default=True) else 0,
                 }
             )
@@ -755,6 +823,7 @@ class DB(object):
 
     def _iter_builtin_probe_requests(self):
         rows = _safe_read_json_array(self.banner_requests_file, "requests")
+        source = "file" if rows else "builtin"
         output = []
         seen_keys = set()
         if rows:
@@ -789,6 +858,9 @@ class DB(object):
                     description=str(row.get("description", "") or ""),
                     active=row.get("active", True),
                 )
+            for item in output:
+                item["source"] = source
+                item["mutable"] = 0
             return output
 
         for payload in TCP_HTTP_PROBES:
@@ -843,10 +915,14 @@ class DB(object):
                 payload=payload,
                 name_prefix="Builtin UDP generic probe",
             )
+        for item in output:
+            item["source"] = source
+            item["mutable"] = 0
         return output
 
     def _iter_builtin_ip_presets(self):
         rows = _safe_read_json_array(self.ip_presets_file, "ips")
+        source = "file" if rows else "builtin"
         output = []
         for row in rows:
             if not isinstance(row, dict):
@@ -860,6 +936,8 @@ class DB(object):
                     "value": value,
                     "label": str(row.get("label", "") or ""),
                     "description": str(row.get("description", "") or ""),
+                    "source": source,
+                    "mutable": 0,
                     "active": 1 if _parse_bool(row.get("active", True), default=True) else 0,
                 }
             )
@@ -874,7 +952,7 @@ class DB(object):
                 "rule_key, rule_id, label, pattern, flags, category, service, protocol, "
                 "product, server, os, version, runtime, framework, vendor, powered_by, "
                 "source, mutable, active"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'builtin', 0, ?);",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 (
                     row["rule_key"],
                     row["rule_id"],
@@ -892,6 +970,8 @@ class DB(object):
                     row["framework"],
                     row["vendor"],
                     row["powered_by"],
+                    str(row.get("source", "builtin") or "builtin"),
+                    int(row.get("mutable", 0) or 0),
                     int(row["active"]),
                 ),
             )
@@ -901,7 +981,7 @@ class DB(object):
                 "INSERT OR IGNORE INTO banner_probe_catalog ("
                 "request_key, name, proto, scope, port, payload_format, payload_encoded, payload, "
                 "description, source, mutable, active"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'builtin', 0, ?);",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 (
                     row["request_key"],
                     row["name"],
@@ -912,6 +992,8 @@ class DB(object):
                     row["payload_encoded"],
                     row["payload"],
                     row["description"],
+                    str(row.get("source", "builtin") or "builtin"),
+                    int(row.get("mutable", 0) or 0),
                     int(row["active"]),
                 ),
             )
@@ -920,11 +1002,13 @@ class DB(object):
             cursor.execute(
                 "INSERT OR IGNORE INTO ip_catalog ("
                 "value, label, description, source, mutable, active"
-                ") VALUES (?, ?, ?, 'builtin', 0, ?);",
+                ") VALUES (?, ?, ?, ?, ?, ?);",
                 (
                     row["value"],
                     row["label"],
                     row["description"],
+                    str(row.get("source", "builtin") or "builtin"),
+                    int(row.get("mutable", 0) or 0),
                     int(row["active"]),
                 ),
             )
@@ -1146,6 +1230,84 @@ class DB(object):
         except Exception as e:
             self.conn.rollback()
             print("DB() -> insert_banner_regex_rule():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def insert_banner_regex_rule_seed(self, data, source="file"):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_regex_row(data, require_id=False)
+            source_value = str(source or "file").strip() or "file"
+            cursor.execute(
+                "INSERT OR IGNORE INTO banner_regex_catalog ("
+                "rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);",
+                (
+                    item["rule_key"],
+                    item["rule_id"],
+                    item["label"],
+                    item["pattern"],
+                    int(item["flags"]),
+                    item["category"],
+                    item["service"],
+                    item["protocol"],
+                    item["product"],
+                    item["server"],
+                    item["os"],
+                    item["version"],
+                    item["runtime"],
+                    item["framework"],
+                    item["vendor"],
+                    item["powered_by"],
+                    source_value,
+                    int(item["active"]),
+                ),
+            )
+            self.conn.commit()
+            self._refresh_runtime_banner_rules_locked(cursor=cursor)
+            cursor.execute(
+                "SELECT id, rule_key, rule_id, label, pattern, flags, category, service, protocol, "
+                "product, server, os, version, runtime, framework, vendor, powered_by, "
+                "source, mutable, active, created_at, updated_at "
+                "FROM banner_regex_catalog WHERE rule_key = ? LIMIT 1;",
+                (item["rule_key"],),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "rule_key": str(row[1] or ""),
+                    "rule_id": str(row[2] or ""),
+                    "label": str(row[3] or ""),
+                    "pattern": str(row[4] or ""),
+                    "flags": int(row[5] or 0),
+                    "category": str(row[6] or ""),
+                    "service": str(row[7] or ""),
+                    "protocol": str(row[8] or ""),
+                    "product": str(row[9] or ""),
+                    "server": str(row[10] or ""),
+                    "os": str(row[11] or ""),
+                    "version": str(row[12] or ""),
+                    "runtime": str(row[13] or ""),
+                    "framework": str(row[14] or ""),
+                    "vendor": str(row[15] or ""),
+                    "powered_by": str(row[16] or ""),
+                    "source": str(row[17] or ""),
+                    "mutable": bool(int(row[18] or 0)),
+                    "active": bool(int(row[19] or 0)),
+                    "created_at": str(row[20] or ""),
+                    "updated_at": str(row[21] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_banner_regex_rule_seed():", e)
             raise
         finally:
             cursor.close()
@@ -1432,6 +1594,67 @@ class DB(object):
             self.lock.release()
         return output
 
+    def insert_banner_probe_request_seed(self, data, source="file"):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            item = self._normalize_banner_probe_row(data, require_id=False)
+            source_value = str(source or "file").strip() or "file"
+            cursor.execute(
+                "INSERT OR IGNORE INTO banner_probe_catalog ("
+                "request_key, name, proto, scope, port, payload_format, payload_encoded, payload, "
+                "description, source, mutable, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);",
+                (
+                    item["request_key"],
+                    item["name"],
+                    item["proto"],
+                    item["scope"],
+                    int(item["port"]),
+                    item["payload_format"],
+                    item["payload_encoded"],
+                    item["payload"],
+                    item["description"],
+                    source_value,
+                    int(item["active"]),
+                ),
+            )
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, request_key, name, proto, scope, port, payload_format, payload_encoded, "
+                "payload, description, source, mutable, active, created_at, updated_at "
+                "FROM banner_probe_catalog WHERE request_key = ? LIMIT 1;",
+                (item["request_key"],),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "request_key": str(row[1] or ""),
+                    "name": str(row[2] or ""),
+                    "proto": str(row[3] or ""),
+                    "scope": str(row[4] or ""),
+                    "port": int(row[5] or 0),
+                    "payload_format": str(row[6] or ""),
+                    "payload_encoded": str(row[7] or ""),
+                    "payload": row[8],
+                    "description": str(row[9] or ""),
+                    "source": str(row[10] or ""),
+                    "mutable": bool(int(row[11] or 0)),
+                    "active": bool(int(row[12] or 0)),
+                    "created_at": str(row[13] or ""),
+                    "updated_at": str(row[14] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_banner_probe_request_seed():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
     def update_banner_probe_request(self, data):
         output = {}
         self.lock.acquire()
@@ -1638,6 +1861,49 @@ class DB(object):
         except Exception as e:
             self.conn.rollback()
             print("DB() -> insert_ip_preset():", e)
+            raise
+        finally:
+            cursor.close()
+            self.lock.release()
+        return output
+
+    def insert_ip_preset_seed(self, data, source="file"):
+        output = {}
+        self.lock.acquire()
+        cursor = self.conn.cursor()
+        try:
+            value = _normalize_ip_value((data or {}).get("value", ""))
+            label = str((data or {}).get("label", "") or "").strip()
+            description = str((data or {}).get("description", "") or "")
+            active = 1 if _parse_bool((data or {}).get("active", True), default=True) else 0
+            source_value = str(source or "file").strip() or "file"
+            cursor.execute(
+                "INSERT OR IGNORE INTO ip_catalog (value, label, description, source, mutable, active) "
+                "VALUES (?, ?, ?, ?, 0, ?);",
+                (value, label, description, source_value, active),
+            )
+            self.conn.commit()
+            cursor.execute(
+                "SELECT id, value, label, description, source, mutable, active, created_at, updated_at "
+                "FROM ip_catalog WHERE value = ? LIMIT 1;",
+                (value,),
+            )
+            row = cursor.fetchone()
+            if row:
+                output = {
+                    "id": int(row[0]),
+                    "value": str(row[1] or ""),
+                    "label": str(row[2] or ""),
+                    "description": str(row[3] or ""),
+                    "source": str(row[4] or ""),
+                    "mutable": bool(int(row[5] or 0)),
+                    "active": bool(int(row[6] or 0)),
+                    "created_at": str(row[7] or ""),
+                    "updated_at": str(row[8] or ""),
+                }
+        except Exception as e:
+            self.conn.rollback()
+            print("DB() -> insert_ip_preset_seed():", e)
             raise
         finally:
             cursor.close()
@@ -1987,8 +2253,9 @@ class DB(object):
         try:
             cursor.execute(
                 "INSERT OR IGNORE INTO targets ("
-                "network, type, proto, port_mode, port_start, port_end, timesleep, status"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                "network, type, proto, port_mode, port_start, port_end, "
+                "timesleep, status, agent_mode, agent_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 (
                     data["network"],
                     data["type"],
@@ -1998,6 +2265,8 @@ class DB(object):
                     data.get("port_end"),
                     data["timesleep"],
                     data.get("status", "active"),
+                    data.get("agent_mode", "random"),
+                    data.get("agent_id", ""),
                 ),
             )
             self.conn.commit()
@@ -2029,7 +2298,9 @@ class DB(object):
                     " port_end = ?,"
                     " progress = ?,"
                     " timesleep = ?,"
-                    " status = ? "
+                    " status = ?,"
+                    " agent_mode = ?,"
+                    " agent_id = ? "
                     "WHERE id = ?;",
                     (
                         data["network"],
@@ -2041,6 +2312,8 @@ class DB(object):
                         0.0,
                         data["timesleep"],
                         data.get("status", "active"),
+                        data.get("agent_mode", "random"),
+                        data.get("agent_id", ""),
                         data["id"],
                     ),
                 )
@@ -3370,6 +3643,9 @@ class API(threading.Thread):
         output["port_mode"] = port_config["port_mode"]
         output["port_start"] = port_config["port_start"]
         output["port_end"] = port_config["port_end"]
+        agent_config = normalize_target_agent_config(output)
+        output["agent_mode"] = agent_config["agent_mode"]
+        output["agent_id"] = agent_config["agent_id"]
 
         return output
 

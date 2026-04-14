@@ -188,11 +188,21 @@ def _target_proto_set(proto_value):
 
 
 class AgentRuntime:
-    def __init__(self, db):
+    def __init__(
+        self,
+        db,
+        master_base_url="",
+        agent_id="",
+        agent_token="",
+        poll_seconds=None,
+        http_timeout=None,
+    ):
         self.db = db
-        self.master_base_url = normalize_master_base_url(
-            getattr(settings, "PORTHOUND_MASTER", "")
+        configured_master = (
+            str(master_base_url).strip()
+            or str(getattr(settings, "PORTHOUND_MASTER", "")).strip()
         )
+        self.master_base_url = normalize_master_base_url(configured_master)
         if not self.master_base_url:
             raise RuntimeError("PORTHOUND_MASTER is required in agent mode")
         parsed_master = urlsplit(self.master_base_url)
@@ -205,16 +215,24 @@ class AgentRuntime:
                 "[agent] warning: PORTHOUND_MASTER uses loopback "
                 f"({master_host}); this only works when master and agent run on the same host"
             )
-        self.agent_token = str(getattr(settings, "AGENT_TOKEN", "") or "").strip()
+        self.agent_token = str(agent_token or "").strip()
+        if not self.agent_token:
+            self.agent_token = str(getattr(settings, "AGENT_TOKEN", "") or "").strip()
         if not self.agent_token:
             self.agent_token = str(getattr(settings, "AGENT_SHARED_KEY", "") or "").strip()
         if not self.agent_token:
             raise RuntimeError("PORTHOUND_AGENT_TOKEN is required in agent mode")
         self.agent_shared_key = self.agent_token
         self.auth_mode = "token"
-        self.poll_seconds = int(getattr(settings, "AGENT_POLL_SECONDS", 8) or 8)
-        self.http_timeout = float(getattr(settings, "AGENT_HTTP_TIMEOUT", 20.0) or 20.0)
-        configured_agent_id = str(getattr(settings, "AGENT_ID", "") or "").strip()
+        if poll_seconds is None:
+            poll_seconds = getattr(settings, "AGENT_POLL_SECONDS", 8)
+        if http_timeout is None:
+            http_timeout = getattr(settings, "AGENT_HTTP_TIMEOUT", 20.0)
+        self.poll_seconds = int(poll_seconds or 8)
+        self.http_timeout = float(http_timeout or 20.0)
+        configured_agent_id = str(agent_id or "").strip()
+        if not configured_agent_id:
+            configured_agent_id = str(getattr(settings, "AGENT_ID", "") or "").strip()
         if configured_agent_id:
             self.agent_id = configured_agent_id
         else:
@@ -299,7 +317,14 @@ class AgentRuntime:
             raise RuntimeError(f"Agent submit failed: {response}")
         return response
 
-    def send_heartbeat(self, task_id="", master_target_id=None, progress=0.0, status="active"):
+    def send_heartbeat(
+        self,
+        task_id="",
+        master_target_id=None,
+        progress=0.0,
+        status="active",
+        result_delta=None,
+    ):
         payload = self._auth_payload()
         payload["progress"] = float(progress if progress is not None else 0.0)
         payload["status"] = str(status or "").strip().lower() or "active"
@@ -307,6 +332,8 @@ class AgentRuntime:
             payload["task_id"] = str(task_id).strip()
         if master_target_id is not None and str(master_target_id).strip():
             payload["master_target_id"] = int(master_target_id)
+        if isinstance(result_delta, dict) and self._result_has_rows(result_delta):
+            payload["result"] = result_delta
         return self._post("/api/cluster/agent/heartbeat", payload)
 
     def _find_target_row(self, target_item):
@@ -360,18 +387,45 @@ class AgentRuntime:
         self.db.set_target_status(data={"id": target_id, "status": "active"})
         return target_id, target_candidate
 
+    def _result_has_rows(self, result_payload):
+        if not isinstance(result_payload, dict):
+            return False
+        for key in ("ports", "tags", "banners", "favicons"):
+            rows = result_payload.get(key, [])
+            if isinstance(rows, list) and rows:
+                return True
+        return False
+
+    def _new_result_markers(self):
+        return {"ports": set(), "tags": set(), "banners": set(), "favicons": set()}
+
+    def _commit_result_markers(self, sent_markers, pending_markers):
+        if not isinstance(sent_markers, dict) or not isinstance(pending_markers, dict):
+            return
+        for key in ("ports", "tags", "banners", "favicons"):
+            current = sent_markers.get(key)
+            pending = pending_markers.get(key)
+            if not isinstance(current, set) or not isinstance(pending, set) or not pending:
+                continue
+            current.update(pending)
+
     def wait_target_completion(
         self,
         target_id,
         timeout_seconds=86400,
         task_id="",
         master_target_id=None,
+        heartbeat_result_collector=None,
     ):
         started_at = time.time()
         last_progress = 0.0
         last_status = "active"
         abort_action = ""
-        heartbeat_interval = max(5.0, float(self.poll_seconds))
+        heartbeat_interval = float(
+            getattr(settings, "AGENT_HEARTBEAT_SECONDS", 2.0) or 2.0
+        )
+        if heartbeat_interval < 1.0:
+            heartbeat_interval = 1.0
         next_heartbeat_at = 0.0
         progress_log_interval = 10.0
         next_progress_log_at = started_at + 5.0
@@ -408,13 +462,35 @@ class AgentRuntime:
                 )
                 next_progress_log_at = now_ts + progress_log_interval
             if now_ts >= next_heartbeat_at:
+                heartbeat_result = None
+                heartbeat_commit = None
+                if callable(heartbeat_result_collector):
+                    try:
+                        collected = heartbeat_result_collector(last_progress, last_status)
+                        if (
+                            isinstance(collected, tuple)
+                            and len(collected) == 2
+                        ):
+                            heartbeat_result = collected[0]
+                            heartbeat_commit = collected[1]
+                        elif isinstance(collected, dict):
+                            heartbeat_result = collected
+                    except Exception:
+                        heartbeat_result = None
+                        heartbeat_commit = None
                 try:
                     response = self.send_heartbeat(
                         task_id=task_id,
                         master_target_id=master_target_id,
                         progress=last_progress,
                         status=last_status,
+                        result_delta=heartbeat_result,
                     )
+                    if callable(heartbeat_commit):
+                        try:
+                            heartbeat_commit()
+                        except Exception:
+                            pass
                     desired_action = (
                         str((response or {}).get("desired_action", "")).strip().lower()
                     )
@@ -456,8 +532,14 @@ class AgentRuntime:
             time.sleep(1.0)
 
     def collect_result_payload(self, target_payload):
+        result, _ = self.collect_result_payload_delta(target_payload, sent_markers=None)
+        return result
+
+    def collect_result_payload_delta(self, target_payload, sent_markers=None):
         network = ip_network(str(target_payload.get("network", "")).strip(), strict=False)
         proto_set = _target_proto_set(target_payload.get("proto"))
+        pending_markers = self._new_result_markers()
+        use_markers = isinstance(sent_markers, dict)
 
         def in_target(ip_value):
             try:
@@ -473,6 +555,16 @@ class AgentRuntime:
             ip_value = str((row or {}).get("ip", "")).strip()
             if not in_target(ip_value):
                 continue
+            marker = (
+                ip_value,
+                int((row or {}).get("port", 0) or 0),
+                proto_value,
+                str((row or {}).get("state", "open")).strip().lower(),
+                str((row or {}).get("updated_at", "")),
+            )
+            if use_markers and marker in sent_markers.get("ports", set()):
+                continue
+            pending_markers["ports"].add(marker)
             ports.append(
                 {
                     "ip": ip_value,
@@ -490,6 +582,17 @@ class AgentRuntime:
             ip_value = str((row or {}).get("ip", "")).strip()
             if not in_target(ip_value):
                 continue
+            marker = (
+                ip_value,
+                int((row or {}).get("port", 0) or 0),
+                proto_value,
+                str((row or {}).get("key", ""))[:120],
+                str((row or {}).get("value", ""))[:4096],
+                str((row or {}).get("updated_at", "")),
+            )
+            if use_markers and marker in sent_markers.get("tags", set()):
+                continue
+            pending_markers["tags"].add(marker)
             tags.append(
                 {
                     "ip": ip_value,
@@ -508,6 +611,13 @@ class AgentRuntime:
             ip_value = str((row or {}).get("ip", "")).strip()
             if not in_target(ip_value):
                 continue
+            marker = (
+                int((row or {}).get("id", 0) or 0),
+                str((row or {}).get("updated_at", "")),
+            )
+            if use_markers and marker in sent_markers.get("banners", set()):
+                continue
+            pending_markers["banners"].add(marker)
             banners.append(
                 {
                     "ip": ip_value,
@@ -525,12 +635,17 @@ class AgentRuntime:
             ip_value = str((row or {}).get("ip", "")).strip()
             if not in_target(ip_value):
                 continue
-            raw = self.db.get_favicon_by_id(int((row or {}).get("id", 0) or 0))
+            icon_id = int((row or {}).get("id", 0) or 0)
+            marker = (icon_id, str((row or {}).get("updated_at", "")))
+            if use_markers and marker in sent_markers.get("favicons", set()):
+                continue
+            raw = self.db.get_favicon_by_id(icon_id)
             if not raw:
                 continue
             icon_blob = bytes(raw.get("icon_blob") or b"")
             if not icon_blob:
                 continue
+            pending_markers["favicons"].add(marker)
             favicons.append(
                 {
                     "ip": str(raw.get("ip", "")).strip(),
@@ -545,12 +660,15 @@ class AgentRuntime:
                 }
             )
 
-        return {
-            "ports": ports,
-            "tags": tags,
-            "banners": banners,
-            "favicons": favicons,
-        }
+        return (
+            {
+                "ports": ports,
+                "tags": tags,
+                "banners": banners,
+                "favicons": favicons,
+            },
+            pending_markers,
+        )
 
     def cleanup_local_target(self, target_id):
         try:
@@ -595,19 +713,41 @@ class AgentRuntime:
         abort_action = ""
         error = ""
         result = {"ports": [], "tags": [], "banners": [], "favicons": []}
+        sent_markers = self._new_result_markers()
+        normalized_target = None
         try:
             local_target_id, normalized_target = self.ensure_local_target(target_payload)
+
+            def _collect_heartbeat_result(_progress_value, _status_value):
+                if not isinstance(normalized_target, dict):
+                    return None, None
+                delta_result, pending_markers = self.collect_result_payload_delta(
+                    normalized_target,
+                    sent_markers=sent_markers,
+                )
+                if not self._result_has_rows(delta_result):
+                    return None, None
+                return (
+                    delta_result,
+                    lambda: self._commit_result_markers(sent_markers, pending_markers),
+                )
+
             progress, status, abort_action = self.wait_target_completion(
                 local_target_id,
                 task_id=task_id,
                 master_target_id=master_target_id,
+                heartbeat_result_collector=_collect_heartbeat_result,
             )
             if abort_action in {"restart", "delete"}:
                 status = "stopped"
                 if not error:
                     error = f"aborted_by_master:{abort_action}"
             else:
-                result = self.collect_result_payload(normalized_target)
+                # Keep final submit lightweight: only include rows not already acknowledged by heartbeat sync.
+                result, _pending_markers = self.collect_result_payload_delta(
+                    normalized_target,
+                    sent_markers=sent_markers,
+                )
                 status = "active" if progress >= 100.0 else status
         except Exception as exc:
             error = str(exc)

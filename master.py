@@ -30,6 +30,8 @@ def run_master_mode(enable_local_scanners=False):
     ssl_context = build_master_ssl_context()
     app_module.app.add_startup(app_module.register_frontend_dist_routes)
     app_module.app.add_startup(app_module.start_geoip_blocks_db)
+    if not enable_local_scanners:
+        app_module.app.add_startup(app_module.start_local_cluster_agent)
     if enable_local_scanners:
         app_module.app.add_startup(app_module.start_scanners)
     app_module.app.add_startup(app_module.start_scan_map_telemetry)

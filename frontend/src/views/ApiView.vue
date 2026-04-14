@@ -14,6 +14,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       @refresh="load"
     >
       <template #skeleton>
@@ -84,6 +85,12 @@ const FALLBACK_ENDPOINTS = [
   { method: "GET", path: "/api/dashboard/", desc: "Frontend dashboard snapshot." },
   { method: "GET", path: "/api/endpoints/", desc: "Endpoint catalog." },
   { method: "GET", path: "/api/map/scan", desc: "Geolocated scan map snapshot." },
+  { method: "GET", path: "/api/catalog/file/banner-rules", desc: "List banner regex rules from file." },
+  { method: "POST", path: "/api/catalog/file/banner-rules", desc: "Append banner regex rule to file + DB." },
+  { method: "GET", path: "/api/catalog/file/banner-requests", desc: "List banner probe requests from file." },
+  { method: "POST", path: "/api/catalog/file/banner-requests", desc: "Append banner probe request to file + DB." },
+  { method: "GET", path: "/api/catalog/file/ip-presets", desc: "List IP presets from file." },
+  { method: "POST", path: "/api/catalog/file/ip-presets", desc: "Append IP preset to file + DB." },
   { method: "GET", path: "/api/catalog/banner-rules/", desc: "List regex banner rules." },
   { method: "POST", path: "/api/catalog/banner-rules/", desc: "Create custom regex banner rule." },
   { method: "PUT", path: "/api/catalog/banner-rules/", desc: "Update custom regex banner rule." },

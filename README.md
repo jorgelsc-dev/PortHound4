@@ -57,14 +57,14 @@ source env/bin/activate
 env/bin/python manage.py
 ```
 
-Entrada directa equivalente:
+Entrada directa equivalente (solo runtime, sin web de estado):
 
 ```bash
 env/bin/python master.py
 ```
 
-Al ejecutar `python manage.py`, se asume `master` y te pedira:
-- `IP`: `0.0.0.0`
+Al ejecutar `python manage.py`, se asume `master` con:
+- `IP`: `127.0.0.1`
 - `Port`: `45678`
 - (TLS queda desactivado por politica)
 
@@ -73,8 +73,6 @@ Al ejecutar `python manage.py`, se asume `master` y te pedira:
 ```bash
 env/bin/python manage.py \
   --role master \
-  --host 0.0.0.0 \
-  --port 45678 \
   --db-path Master.db
 ```
 
@@ -84,7 +82,7 @@ env/bin/python manage.py \
 env/bin/python manage.py
 ```
 
-`manage.py` abre wizard en terminal (uno por uno) y usa la DB del rol (`Master.db`) como valores por defecto.
+`manage.py` funciona en modo no interactivo: toma valores de flags/env/base64 y usa la DB del rol (`Master.db`) como defaults.
 
 4. Verifica que el master responda:
 - UI/API: `http://localhost:45678` o `http://127.0.0.1:45678`
@@ -93,7 +91,6 @@ env/bin/python manage.py
 
 5. Si ya guardaste valores incorrectos en DB:
 - Vuelve a ejecutar con argumentos explicitos (sobrescribe y guarda de nuevo).
-- O ejecuta `env/bin/python manage.py --interactive` y corrige los campos.
 
 ### 3) Paso a paso: Agente (repetir por cada agente)
 
@@ -102,62 +99,38 @@ env/bin/python manage.py
 - Copia `agent_id` + `token` del bloque generado.
 - Copia el `ENROLL BASE64` (contiene JSON con todo lo necesario).
 - Copia `COMANDO RAPIDO (copiar/pegar en el agente)`.
-- Ese bloque ya trae exactamente lo que debes responder en el wizard del agente.
+- Ese bloque trae todo lo necesario para ejecutar el agente sin wizard.
 
-2. En el agente:
+2. Comandos soportados (modo simple):
 
-```bash
-env/bin/python manage.py agent
-```
-
-Entrada directa equivalente:
+- Master (sin base64):
 
 ```bash
-env/bin/python agent.py
-```
-
-Al ejecutar `python manage.py agent`, te pedira:
-- `Enroll base64 (opcional)`: pega el base64 del master para autocompletar todo.
-- `agent_id`: `<agent_id generado en la web>`
-- `token`: `<token generado en la web>`
-- `master_ip`: `<IP del master>`
-- `master_host`: `<host del master>`
-
-3. Enroll directo (recomendado si ya tienes base64):
-
-```bash
-env/bin/python manage.py agent --enroll '<BASE64_DEL_MASTER>'
-```
-
-4. Inicia un agente por argumentos (opcional para remoto):
-
-```bash
-env/bin/python manage.py \
-  --role agent \
-  --master http://<MASTER_HOST>:45678 \
-  --agent-id <agent_id_generado_en_web> \
-  --agent-token <token_generado_en_web> \
-  --ip <IP_DE_SALIDA_DEL_AGENTE>
-```
-
-5. Alternativa rapida por env (sin argumentos):
-
-```bash
-export PORTHOUND_ROLE=agent
-export PORTHOUND_MASTER=http://<MASTER_HOST>:45678
-export PORTHOUND_AGENT_ID=<agent_id_generado_en_web>
-export PORTHOUND_AGENT_TOKEN=<token_generado_en_web>
-export PORTHOUND_IP=<IP_DE_SALIDA_DEL_AGENTE>
 env/bin/python manage.py
 ```
 
+- Agente (con base64 generado por el master):
+
+```bash
+env/bin/python manage.py '<BASE64_DEL_MASTER>'
+```
+
+Notas:
+- Sin base64 siempre es `master` (`127.0.0.1:45678`).
+- Con base64 siempre es `agent` (`127.0.0.1:45677`).
+- Si pasas `--host` o `--port`, el launcher los ignora por politica fija.
+
+Web del agente (estado simple):
+- `http://127.0.0.1:45677/`
+- API: `GET /api/agent/status`
+
 ### 4) Verificacion final (master + agentes)
 
-- Abre `http://<MASTER_HOST>:45678/cluster/agents/` y confirma `online`.
+- Abre `http://127.0.0.1:45678/cluster/agents/` y confirma `online`.
 - Consulta API de agentes:
 
 ```bash
-curl http://<MASTER_HOST>:45678/api/cluster/agents
+curl http://127.0.0.1:45678/api/cluster/agents
 ```
 
 ### Ejecucion legacy (sin cluster)
@@ -172,7 +145,7 @@ env/bin/python ws_demo.py  # Demo HTTP/WS
 1. Inicia el master con `env/bin/python master.py` o `env/bin/python manage.py`.
 2. Abre `http://localhost:45678/cluster/agents/`.
 3. Crea una credencial de agente y copia `agent_id` + `token`.
-4. En el agente ejecuta `env/bin/python agent.py` o `env/bin/python manage.py agent`.
+4. En el agente ejecuta `env/bin/python agent.py` o `env/bin/python manage.py '<BASE64>'`.
 5. Verifica en la vista de agentes que el estado aparezca como `online`.
 
 ### Problemas comunes de conectividad
@@ -189,6 +162,39 @@ env/bin/python ws_demo.py  # Demo HTTP/WS
   - Un escaneo `full` (1-65534) puede tardar mucho tiempo segun `timesleep` y timeouts de red.
   - El agente ahora imprime progreso periodico en consola: `[agent] task progress ...`.
   - Puedes ajustar deteccion de estancamiento con `PORTHOUND_AGENT_TASK_STALL_SECONDS` (minimo 90, por defecto 300).
+
+### 5) Empaquetado (APT + ZIP)
+
+Paquete Debian (`.deb`) instalable con `apt`:
+
+```bash
+./packaging/deb/build.sh
+sudo apt install ./dist/deb/porthound4_<version>-1_all.deb
+```
+
+Paquete portable (`.zip`):
+
+```bash
+./packaging/zip/build.sh
+unzip dist/zip/porthound4_<version>-1.zip
+cd porthound4_<version>-1
+python3 manage.py
+```
+
+Comandos utiles (APT):
+
+```bash
+porthound4 --help
+sudo systemctl enable --now porthound4
+sudo systemctl status porthound4
+```
+
+Archivo de configuracion del servicio:
+- `/etc/default/porthound4`
+
+Release automatica en `main`:
+- publica `porthound4_<version>-<rev>_all.deb`
+- publica `porthound4_<version>-<rev>.zip`
 
 ---
 

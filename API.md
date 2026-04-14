@@ -11,7 +11,7 @@ If you deploy behind a reverse proxy with TLS, external clients may use `https:/
 Admin-protected endpoints use this rule:
 
 1. If `PORTHOUND_API_TOKEN` is set: send `Authorization: Bearer <token>` (or `X-API-Key`).
-2. If `PORTHOUND_API_TOKEN` is not set: admin calls are allowed only from loopback (`127.0.0.1` / `::1`).
+2. If `PORTHOUND_API_TOKEN` is not set: admin calls are allowed only from loopback (`127.0.0.1` / `::1`), and browser requests with `Origin` must also be loopback (`localhost` / `127.0.0.1` / `::1`).
 3. If `PORTHOUND_API_REQUIRE_TOKEN=1` and no token is configured: admin calls are rejected.
 
 ## Core read endpoints (non-admin)
@@ -69,7 +69,7 @@ Catalog endpoints:
 - `GET /api/catalog/ip-presets/`
 - `POST|PUT|DELETE` on those same routes are admin-protected.
 
-IP intel endpoints (non-admin):
+IP intel endpoints (admin):
 - `GET /api/ip/domains/?ip=<ipv4>`
 - `GET /api/ip/ttl-path/?ip=<ipv4>`
 - `GET /api/ip/intel/?ip=<ipv4>`
