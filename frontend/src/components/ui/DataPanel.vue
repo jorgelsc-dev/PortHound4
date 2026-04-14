@@ -17,17 +17,14 @@
         <v-chip v-if="lastUpdated" size="small" variant="outlined" color="info">
           {{ lastUpdated }}
         </v-chip>
-        <v-btn
-          v-if="showRefresh"
-          size="small"
-          variant="outlined"
-          color="primary"
-          prepend-icon="mdi-refresh"
+        <LiveRefreshControl
+          v-if="showRefresh || liveRefresh"
           :loading="loading"
-          @click="$emit('refresh')"
-        >
-          {{ refreshLabel }}
-        </v-btn>
+          :show-manual="showRefresh"
+          :show-live="liveRefresh"
+          :refresh-label="refreshLabel"
+          @refresh="$emit('refresh')"
+        />
       </div>
     </div>
 
@@ -96,8 +93,13 @@
 </template>
 
 <script>
+import LiveRefreshControl from "./LiveRefreshControl.vue";
+
 export default {
   name: "DataPanel",
+  components: {
+    LiveRefreshControl,
+  },
   props: {
     title: {
       type: String,
@@ -124,6 +126,10 @@ export default {
       default: "",
     },
     showRefresh: {
+      type: Boolean,
+      default: false,
+    },
+    liveRefresh: {
       type: Boolean,
       default: false,
     },

@@ -57,6 +57,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       empty-text="No tags available"
       @refresh="load"
     />

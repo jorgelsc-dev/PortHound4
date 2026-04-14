@@ -58,7 +58,7 @@
           <v-text-field
             v-model.trim="newAgentId"
             label="agent_id (opcional)"
-            placeholder="edge-havana-01"
+            placeholder="edge-agent-01"
             prepend-inner-icon="mdi-identifier"
             :disabled="creatingCredential"
             variant="outlined"
@@ -102,7 +102,7 @@
       >
         Guia rapida:
         1) Copia el `ENROLL BASE64`.
-        2) En el agente ejecuta `env/bin/python manage.py agent --enroll &lt;base64&gt;`.
+        2) En el agente ejecuta `env/bin/python manage.py &lt;base64&gt;`.
         3) Si prefieres, copia el comando completo con base64.
       </v-alert>
 
@@ -169,6 +169,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdatedLabel"
+      :live-refresh="true"
       empty-text="No agents registered"
       @refresh="load"
     >
@@ -445,7 +446,7 @@ export default {
       });
       const enrollBase64 = this.encodeBase64Unicode(JSON.stringify(payload));
       const enrollCommand = enrollBase64
-        ? `env/bin/python manage.py agent --enroll '${enrollBase64}'`
+        ? `env/bin/python manage.py '${enrollBase64}'`
         : "";
       return {
         agent_id: agentId,

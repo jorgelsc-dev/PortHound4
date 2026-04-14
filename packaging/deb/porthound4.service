@@ -1,0 +1,22 @@
+[Unit]
+Description=PortHound4 master service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=porthound
+Group=porthound
+WorkingDirectory=/opt/porthound4
+EnvironmentFile=-/etc/default/porthound4
+ExecStart=/usr/bin/porthound4
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/porthound4
+
+[Install]
+WantedBy=multi-user.target

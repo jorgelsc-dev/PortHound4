@@ -118,6 +118,19 @@
               density="comfortable"
             />
           </v-col>
+          <v-col cols="12" md="4">
+            <v-select
+              v-model="form.agent_route"
+              :items="agentRouteOptions"
+              label="Scan Agent"
+              item-title="label"
+              item-value="value"
+              :loading="creating || loading"
+              :disabled="creating || loading"
+              variant="outlined"
+              density="comfortable"
+            />
+          </v-col>
           <v-col cols="12" md="2" class="d-flex align-center">
             <v-btn
               color="primary"
@@ -194,6 +207,7 @@
       :loading="loading"
       :error="error"
       :last-updated="lastUpdated"
+      :live-refresh="true"
       empty-text="No targets registered"
       @refresh="load"
     >
@@ -209,6 +223,10 @@
         <v-chip size="small" :color="statusColor(value)" variant="tonal">
           {{ normalizeStatus(value) }}
         </v-chip>
+      </template>
+
+      <template #cell-agent_route="{ item }">
+        <span>{{ formatTargetAgentRoute(item) }}</span>
       </template>
 
       <template #cell-actions="{ item }">
@@ -289,6 +307,7 @@ export default {
         { key: "type", label: "Type" },
         { key: "proto", label: "Proto" },
         { key: "port_scope", label: "Port Scope" },
+        { key: "agent_route", label: "Agent Route" },
         { key: "status", label: "Status" },
         { key: "progress", label: "Progress" },
         { key: "timesleep", label: "Timesleep" },
@@ -301,6 +320,7 @@ export default {
         { label: "Range", value: "range" },
       ],
       protos: [],
+      clusterAgentIds: [],
       form: {
         network: "",
         type: "common",
@@ -310,6 +330,7 @@ export default {
         port_start: 1,
         port_end: 1024,
         timesleep: 0.5,
+        agent_route: "random",
       },
       actionLoading: {
         id: null,
@@ -347,6 +368,32 @@ export default {
         .sort();
       return [{ label: "All", value: "" }, ...values.map((value) => ({ label: value, value }))];
     },
+    agentRouteOptions() {
+      const options = [
+        { label: "Random", value: "random" },
+        { label: "Local", value: "local" },
+      ];
+      const ids = [...new Set((this.clusterAgentIds || []).map((item) => String(item || "").trim()))]
+        .filter((item) => item && item.toLowerCase() !== "local")
+        .sort((a, b) => a.localeCompare(b));
+      ids.forEach((agentId) => {
+        options.push({
+          label: `Agent: ${agentId}`,
+          value: `agent:${agentId}`,
+        });
+      });
+      const selected = String(this.form.agent_route || "").trim();
+      if (selected.startsWith("agent:") && !options.some((item) => item.value === selected)) {
+        const selectedId = selected.slice("agent:".length).trim();
+        if (selectedId) {
+          options.push({
+            label: `Agent: ${selectedId} (manual)`,
+            value: `agent:${selectedId}`,
+          });
+        }
+      }
+      return options;
+    },
     filteredTargets() {
       const query = String(this.tableFilters.query || "").trim().toLowerCase();
       const proto = String(this.tableFilters.proto || "").trim().toLowerCase();
@@ -364,6 +411,8 @@ export default {
           item.proto,
           item.status,
           item.port_mode,
+          item.agent_mode,
+          item.agent_id,
           item.port_start,
           item.port_end,
           item.timesleep,
@@ -414,6 +463,22 @@ export default {
       if (mode === "range") return "range";
       return "preset";
     },
+    normalizeTargetAgentMode(value) {
+      const mode = String(value || "").trim().toLowerCase();
+      if (mode === "local") return "local";
+      if (mode === "agent") return "agent";
+      return "random";
+    },
+    formatTargetAgentRoute(item) {
+      const row = item || {};
+      const mode = this.normalizeTargetAgentMode(row.agent_mode);
+      if (mode === "local") return "local";
+      if (mode === "agent") {
+        const agentId = String(row.agent_id || "").trim();
+        return agentId ? `agent:${agentId}` : "agent:(missing)";
+      }
+      return "random";
+    },
     formatPortScope(item) {
       const mode = this.normalizePortMode(item && item.port_mode);
       const start = Number(item && item.port_start);
@@ -463,6 +528,21 @@ export default {
         payload.port_start = start;
         payload.port_end = end;
       }
+      const route = String(this.form.agent_route || "random").trim();
+      if (route === "local") {
+        payload.agent_mode = "local";
+        payload.agent_id = "local";
+      } else if (route.startsWith("agent:")) {
+        const agentId = route.slice("agent:".length).trim();
+        if (!agentId) {
+          throw new Error("Agent route is invalid");
+        }
+        payload.agent_mode = "agent";
+        payload.agent_id = agentId;
+      } else {
+        payload.agent_mode = "random";
+        payload.agent_id = "";
+      }
       return payload;
     },
     isActionLoading(id, action) {
@@ -481,16 +561,35 @@ export default {
       const unique = [...new Set(items.map((item) => String(item).trim().toLowerCase()))];
       return unique.filter(Boolean);
     },
+    loadClusterAgentIds() {
+      return Promise.allSettled([
+        this.store.fetchJsonPromise("/api/cluster/agent/credentials"),
+        this.store.fetchJsonPromise("/api/cluster/agents"),
+      ]).then((results) => {
+        const ids = new Set();
+        results.forEach((entry) => {
+          if (!entry || entry.status !== "fulfilled") return;
+          const rows = this.store.extractArray(entry.value);
+          rows.forEach((row) => {
+            const agentId = String((row || {}).agent_id || "").trim();
+            if (agentId) ids.add(agentId);
+          });
+        });
+        return [...ids];
+      });
+    },
     load() {
       this.loading = true;
       this.error = "";
       return Promise.all([
         this.store.fetchJsonPromise("/targets/"),
         this.store.fetchJsonPromise("/protocols/"),
+        this.loadClusterAgentIds(),
       ])
-        .then(([targetsRes, protocolsRes]) => {
+        .then(([targetsRes, protocolsRes, agentIds]) => {
           this.targets = this.store.extractArray(targetsRes);
           this.protos = this.normalizeProtocols(protocolsRes);
+          this.clusterAgentIds = Array.isArray(agentIds) ? agentIds : [];
           if (!this.protos.length) {
             this.protos = ["tcp", "udp", "icmp", "sctp"];
           }
@@ -502,6 +601,7 @@ export default {
         .catch((err) => {
           this.targets = [];
           this.protos = ["tcp", "udp", "icmp", "sctp"];
+          this.clusterAgentIds = [];
           if (!this.protos.includes(this.form.proto)) {
             this.form.proto = this.protos[0];
           }

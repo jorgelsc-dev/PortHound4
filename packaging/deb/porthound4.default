@@ -1,0 +1,14 @@
+# PortHound4 service environment
+# Loaded by: /lib/systemd/system/porthound4.service
+
+PORTHOUND_ROLE=master
+PORTHOUND_HOST=0.0.0.0
+PORTHOUND_PORT=45678
+PORTHOUND_DB_PATH=/var/lib/porthound4/Master.db
+
+# Optional hardening for administrative endpoints:
+# PORTHOUND_API_TOKEN=change-me
+# PORTHOUND_API_REQUIRE_TOKEN=1
+
+# Optional CORS:
+# PORTHOUND_CORS_ALLOW_ORIGIN=*

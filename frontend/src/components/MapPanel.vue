@@ -6,6 +6,7 @@
     :error="error"
     :last-updated="lastUpdated"
     :show-refresh="showRefresh"
+    :live-refresh="showRefresh"
     :show-header="showPanelHeader"
     :keep-content-on-loading="true"
     @refresh="manualRefresh"
@@ -59,18 +60,14 @@
         </div>
 
         <div class="map-overlay__meta">
-          <v-btn
+          <LiveRefreshControl
             v-if="showRefresh && !showPanelHeader"
-            size="small"
-            variant="outlined"
-            color="primary"
-            prepend-icon="mdi-refresh"
             :loading="loading"
-            class="map-refresh-btn"
-            @click="manualRefresh"
-          >
-            Refresh
-          </v-btn>
+            :show-manual="true"
+            :show-live="true"
+            refresh-label="Refresh"
+            @refresh="manualRefresh"
+          />
           <span class="map-status-pill">{{ projectionLabel }}</span>
           <span class="map-status-pill">{{ wsLabel }}</span>
           <span v-if="geoipSourceLabel" class="map-status-pill map-status-pill--accent">
@@ -495,6 +492,7 @@
 <script>
 import store from "../state/appStore";
 import DataPanel from "./ui/DataPanel.vue";
+import LiveRefreshControl from "./ui/LiveRefreshControl.vue";
 
 const GLOBE_SIMPLE_WORLD_STEP = 5;
 const GLOBE_ROTATION_SPEED = 4.5;
@@ -505,6 +503,7 @@ export default {
   name: "MapPanel",
   components: {
     DataPanel,
+    LiveRefreshControl,
   },
   props: {
     mapOnly: {
