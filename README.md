@@ -1,8 +1,13 @@
 # 🛡️ PortHound4
 
-PortHound4 es una herramienta profesional de ciberseguridad para escaneo de red, deteccion de servicios y banner grabbing. Combina escaneo TCP/UDP, almacenamiento en SQLite y un API/WS ligero para integracion y control.
+[![CI](https://github.com/jorgelsc-dev/PortHound4/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jorgelsc-dev/PortHound4/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-PortHound4 is a professional cybersecurity tool for network scanning, service detection, and banner grabbing. It combines TCP/UDP scanning, SQLite storage, and a lightweight API/WS layer for orchestration.
+PortHound4 es un scanner de red distribuido en Python para auditorias autorizadas. Soporta modos `master`/`agent`/`standalone`, escaneo TCP/UDP/ICMP/SCTP, banner grabbing, persistencia en SQLite y control por API HTTP + WebSocket.
+
+PortHound4 is a distributed Python network scanner for authorized security audits. It supports `master`/`agent`/`standalone` modes, TCP/UDP/ICMP/SCTP scanning, banner grabbing, SQLite persistence, and HTTP + WebSocket APIs.
+
+Keywords: `python`, `network-scanner`, `port-scanner`, `cybersecurity`, `banner-grabbing`, `sqlite`, `websocket`, `master-agent`.
 
 ---
 
@@ -11,6 +16,8 @@ PortHound4 is a professional cybersecurity tool for network scanning, service de
 - `README.md` -> guia principal del proyecto.
 - `FAST.md` -> guia corta, directa y simple para arrancar rapido.
 - `docs/` -> notas tecnicas adicionales.
+- `docs/screenshots/` -> capturas recomendadas para presentar el proyecto en GitHub.
+- `docs/repository_visibility.md` -> checklist de visibilidad/indexacion para GitHub.
 
 ---
 
@@ -279,6 +286,14 @@ Using PortHound for malicious or unauthorized activities goes against profession
 ## 🔐 Security
 
 Please report vulnerabilities privately. See `SECURITY.md`.
+
+---
+
+## 🤝 Community
+
+- Contribution guide: `CONTRIBUTING.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
+- Security policy: `SECURITY.md`
 
 ---
 
