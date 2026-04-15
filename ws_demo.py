@@ -1776,10 +1776,10 @@ class WebSocketHTTPServer:
                 t = ConnectionThread(conn, addr, self.registry, self.db)
                 t.start()
         except KeyboardInterrupt:
-            print("Deteniendo servidor por KeyboardInterrupt...")
+            print("\n[shutdown] interrupted by user (Ctrl+C). stopping server...")
         finally:
             s.close()
-            print("Socket servidor cerrado.")
+            print("[shutdown] server socket closed.")
 
 def run_server(host, port):
     srv = WebSocketHTTPServer(host, port)
