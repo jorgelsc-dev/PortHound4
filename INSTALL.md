@@ -36,11 +36,29 @@ Install with `apt`:
 sudo apt install ./dist/deb/porthound4_<version>-1_all.deb
 ```
 
-Start service:
+Run interactively:
 
 ```bash
-sudo systemctl enable --now porthound4
-sudo systemctl status porthound4
+porthound4
+# stop with Ctrl+C
+```
+
+Explicit master example:
+
+```bash
+porthound4 --role master --host 0.0.0.0 --port 45678 --db-path ./Master.db
+```
+
+Agent example:
+
+```bash
+porthound4 --role agent --master http://127.0.0.1:45678 --agent-id <id> --agent-token <token>
+```
+
+If you are upgrading from an old service-based install:
+
+```bash
+sudo systemctl disable --now porthound4.service
 ```
 
 ## Portable ZIP package

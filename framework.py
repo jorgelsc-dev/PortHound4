@@ -276,6 +276,7 @@ class HTTPServer:
         self._sock = s
         scheme = "https" if self.ssl_context else "http"
         print(f"Server listening on {scheme}://{self.host}:{self.port}/")
+        interrupted = False
         try:
             with ThreadPoolExecutor(
                 max_workers=self.MAX_CONNECTION_WORKERS,
@@ -285,9 +286,12 @@ class HTTPServer:
                     conn, addr = s.accept()
                     pool.submit(self.handle_conn, conn, addr)
         except KeyboardInterrupt:
-            print("Server stopped by KeyboardInterrupt")
+            interrupted = True
+            print("\n[shutdown] interrupted by user (Ctrl+C). stopping server...")
         finally:
             s.close()
+            if interrupted:
+                print("[shutdown] server stopped.")
 
     def handle_conn(self, conn, addr):
         tls_meta = {
