@@ -833,7 +833,11 @@ def run_agent_mode(db=None):
 
 
 def main():
-    run_agent_mode()
+    try:
+        run_agent_mode()
+    except KeyboardInterrupt:
+        print("\n[shutdown] interrupted by user (Ctrl+C).")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

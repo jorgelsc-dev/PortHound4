@@ -192,12 +192,27 @@ Comandos utiles (APT):
 
 ```bash
 porthound4 --help
-sudo systemctl enable --now porthound4
-sudo systemctl status porthound4
+porthound4
+# stop with Ctrl+C
 ```
 
-Archivo de configuracion del servicio:
-- `/etc/default/porthound4`
+Master explicito:
+
+```bash
+porthound4 --role master --host 0.0.0.0 --port 45678 --db-path ./Master.db
+```
+
+Agent explicito:
+
+```bash
+porthound4 --role agent --master http://127.0.0.1:45678 --agent-id <id> --agent-token <token>
+```
+
+Si vienes de una version anterior con servicio activo:
+
+```bash
+sudo systemctl disable --now porthound4.service
+```
 
 Release automatica en `main`:
 - publica `porthound4_<version>-<rev>_all.deb`
