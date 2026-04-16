@@ -17,6 +17,48 @@ Scanner de red distribuido en Python con sondeo TCP/UDP, captura de banners, per
 ### Website (optional)
 Leave empty, or set a docs/demo URL later.
 
+### Apply from terminal (GitHub CLI)
+
+```bash
+gh auth login
+gh repo edit jorgelsc-dev/PortHound4 \
+  --description "Distributed Python network scanner with master/agent orchestration, TCP/UDP/ICMP/SCTP probing, banner grabbing, SQLite persistence, and HTTP/WebSocket APIs." \
+  --add-topic python \
+  --add-topic cybersecurity \
+  --add-topic network-scanner \
+  --add-topic port-scanner \
+  --add-topic banner-grabbing \
+  --add-topic tcp \
+  --add-topic udp \
+  --add-topic icmp \
+  --add-topic sctp \
+  --add-topic sqlite \
+  --add-topic websocket \
+  --add-topic api \
+  --add-topic threading \
+  --add-topic security-audit \
+  --add-topic pentest-tools
+```
+
+Or run the helper script from this repo:
+
+```bash
+gh auth login
+./scripts/set_github_about.sh
+```
+
+If `gh auth status` reports an invalid token, re-authenticate:
+
+```bash
+gh auth login -h github.com
+```
+
+Validate repository discoverability checks:
+
+```bash
+./scripts/repo_visibility_check.sh
+```
+
 ## 3) Topics (GitHub tags)
 `python`, `cybersecurity`, `network-scanner`, `port-scanner`, `banner-grabbing`, `tcp`, `udp`, `sqlite`, `websocket`, `api`, `threading`, `security-audit`, `pentest-tools`
 
